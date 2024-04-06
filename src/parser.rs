@@ -1,0 +1,752 @@
+use std::io::BufRead;
+
+use crate::{
+    CachedToken, Delimiter, Error, Event, Scanner, SequenceStyle, SourceLocation, Span, Spanned,
+    SpannedExt, Token, TokenType,
+};
+
+/// Streaming parser that turns [`Token`]s into [`Event`]s.
+///
+/// This validates the stream of tokens, but does not perform any high-level
+/// transformations, such as organizing key-value pairs into maps or
+/// interpreting escape sequences within strings.
+pub struct ParseStream<R> {
+    scanner: Scanner<R>,
+    inner: ParserInner,
+    pending_consume: Consume,
+    eof: bool,
+}
+
+#[derive(Default)]
+struct ParserInner {
+    lookahead: Lookahead,
+    root: CurlySequenceState,
+    stack: Vec<ParserState>,
+    pending_anchor: PendingAnchor,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum ParserError {
+    #[error("Missing value in key-value pair")]
+    MissingValue,
+    #[error("Unclosed delimiter: {0} at {1}")]
+    UnclosedDelimiter(TokenType, SourceLocation),
+    #[error("Unexpected token: {0} at {1}")]
+    UnexpectedToken(TokenType, SourceLocation),
+    #[error("Lists in square brackets or parentheses must be separated by commas: {0}")]
+    MissingCommaInList(SourceLocation),
+    #[error("Anchors must be followed by a value: {0}")]
+    TrailingAnchor(SourceLocation),
+    #[error("values can only have one anchor: {0}")]
+    MultipleAnchors(SourceLocation),
+    #[error("reference cannot have anchors: {0}")]
+    ReferenceWithAnchor(SourceLocation),
+}
+
+enum ParserState {
+    CurlySequence(CurlySequenceState),
+    SquareSequence(SquareSequenceState),
+    ParensSequence(ParensSequenceState),
+    TaggedValue(TaggedValueState),
+}
+
+enum Consume {
+    Consume2,
+    Consume1,
+    Consume0,
+    Eof,
+}
+
+impl<R: BufRead> ParseStream<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            scanner: Scanner::new(reader),
+            inner: ParserInner::default(),
+            // Initially populate the lookahead buffer with two tokens.
+            pending_consume: Consume::Consume2,
+            eof: false,
+        }
+    }
+
+    pub fn next_event(&mut self) -> Result<Option<Event>, Error> {
+        let Self {
+            scanner,
+            inner,
+            pending_consume,
+            eof,
+        } = self;
+
+        if *eof {
+            return Ok(None);
+        }
+
+        loop {
+            match pending_consume {
+                Consume::Consume0 => {}
+                Consume::Consume1 => {
+                    let token = scanner.next_token()?;
+                    inner.lookahead.set_next(token);
+                }
+                Consume::Consume2 => {
+                    let token = scanner.next_token()?;
+                    inner.lookahead.set_next(token);
+                    let token = scanner.next_token()?;
+                    inner.lookahead.set_next(token);
+                }
+                Consume::Eof => unreachable!("unexpected EOF"),
+            }
+
+            match inner.parse_next()? {
+                (Some(event), consume) => {
+                    *pending_consume = consume;
+                    return Ok(Some(unsafe {
+                        // SAFETY: Upcasting lifetime (valid under Polonius).
+                        std::mem::transmute::<Event<'_>, Event<'_>>(event)
+                    }));
+                }
+                (None, Consume::Eof) => {
+                    *eof = true;
+                    return Ok(None);
+                }
+                (None, consume) => {
+                    // Did not produce an event, just consume tokens and continue.
+                    *pending_consume = consume;
+                    continue;
+                }
+            }
+        }
+    }
+
+    pub fn expect_event(&mut self) -> Result<Event, Error> {
+        self.next_event().and_then(|event| {
+            event.ok_or_else(|| Error::Scanner(crate::ScannerError::UnexpectedEof))
+        })
+    }
+}
+
+impl ParserInner {
+    fn parse_next(&mut self) -> Result<(Option<Event>, Consume), ParserError> {
+        if let Some(state) = self.stack.last() {
+            match state {
+                ParserState::CurlySequence(_) => self.parse_curly_sequence_item(),
+                ParserState::SquareSequence(_) => self.parse_square_sequence_item(),
+                ParserState::ParensSequence(_) => self.parse_parens_sequence_item(),
+                ParserState::TaggedValue(_) => self.parse_value_after_tag_anchor(),
+            }
+        } else {
+            self.parse_curly_sequence_item()
+        }
+    }
+
+    fn parse_curly_sequence_item(&mut self) -> Result<(Option<Event>, Consume), ParserError> {
+        let (state, is_root) = match self.stack.last_mut() {
+            Some(ParserState::CurlySequence(state)) => (state, false),
+            None => (&mut self.root, true),
+            _ => panic!("inconsistent parser state"),
+        };
+
+        let [Some((token, span)), next] = self.lookahead.peek2() else {
+            if is_root {
+                return Ok((None, Consume::Eof));
+            } else {
+                return Err(ParserError::UnclosedDelimiter(
+                    TokenType::SequenceStartCurly,
+                    state.start.start,
+                ));
+            }
+        };
+
+        if state.need_delimiter {
+            match token {
+                Token::Delimiter(..) => {
+                    state.need_delimiter = false;
+                    return Ok((None, Consume::Consume1));
+                }
+                Token::SequenceEndCurly => {}
+                _ => return Err(ParserError::UnexpectedToken(token.ty(), span.start)),
+            }
+        }
+
+        if !state.parsing_kv_value {
+            // Parse a key or a keyless value.
+            Ok(match (token, next.map(|(t, _)| t)) {
+                // Skip newlines.
+                (Token::Delimiter(Delimiter::Newline), _) => (None, Consume::Consume1),
+                // Explicit empty key.
+                (Token::KeySigil, Some(Token::Colon)) if !state.next_is_key => {
+                    state.parsing_kv_value = true;
+                    state.did_parse_colon = true;
+                    state.next_is_key = false;
+                    let colon_span = next.map(|(_, span)| span).unwrap();
+                    (
+                        Some(Event::Empty(span.merge(&colon_span))),
+                        Consume::Consume2,
+                    )
+                }
+                (Token::KeySigil, Some(_)) if !state.next_is_key => {
+                    state.next_is_key = true;
+                    state.did_parse_colon = false;
+                    (None, Consume::Consume1)
+                }
+                (Token::Scalar(scalar), Some(Token::Colon)) if !state.next_is_key => {
+                    state.parsing_kv_value = true;
+                    state.did_parse_colon = true;
+                    state.next_is_key = false;
+                    (Some(Event::Scalar(scalar.in_span(span))), Consume::Consume2)
+                }
+                (Token::SequenceEndCurly, _) => {
+                    self.stack.pop();
+                    (Some(Event::EndMapping(span)), Consume::Consume1)
+                }
+                (Token::Merge(anchor), _) => {
+                    (Some(Event::Merge(anchor.in_span(span))), Consume::Consume1)
+                }
+                _ => {
+                    state.parsing_kv_value = true;
+                    if state.next_is_key {
+                        state.did_parse_colon = false;
+                        state.next_is_key = false;
+                        return Self::do_parse_value(
+                            ((token, span), next),
+                            &mut self.pending_anchor,
+                            &mut self.stack,
+                        );
+                    } else {
+                        // Emit artificial empty key, and pretend we parsed a
+                        // colon, since the next value is keyless.
+                        state.did_parse_colon = true;
+                        (
+                            Some(Event::Empty(Span::empty(span.start))),
+                            Consume::Consume0,
+                        )
+                    }
+                }
+            })
+        } else {
+            // Parse the right-hand side of a key-value pair.
+            Ok(match (token, next.map(|(t, _)| t)) {
+                (Token::Colon, Some(Token::Delimiter(Delimiter::Newline)))
+                    if !state.did_parse_colon =>
+                {
+                    state.parsing_kv_value = false;
+                    (
+                        Some(Event::Empty(Span::empty(span.start))),
+                        Consume::Consume2,
+                    )
+                }
+                (Token::Colon, Some(_)) if !state.did_parse_colon => {
+                    state.did_parse_colon = true;
+                    (None, Consume::Consume1)
+                }
+                _ if state.did_parse_colon => {
+                    state.parsing_kv_value = false;
+                    state.did_parse_colon = false;
+                    state.need_delimiter = true;
+                    return Self::do_parse_value(
+                        ((token, span), next),
+                        &mut self.pending_anchor,
+                        &mut self.stack,
+                    );
+                }
+                _ => {
+                    return Err(ParserError::UnexpectedToken(token.ty(), span.start));
+                }
+            })
+        }
+    }
+
+    fn parse_square_sequence_item(&mut self) -> Result<(Option<Event>, Consume), ParserError> {
+        let state = match self.stack.last_mut() {
+            Some(ParserState::SquareSequence(state)) => state,
+            _ => panic!("inconsistent parser state"),
+        };
+
+        let [Some((token, span)), next] = self.lookahead.peek2() else {
+            return Err(ParserError::UnclosedDelimiter(
+                TokenType::SequenceStartSquare,
+                state.start.start,
+            ));
+        };
+
+        Ok(match (token, next.map(|(t, _)| t)) {
+            (Token::Delimiter(Delimiter::Comma), _) => (None, Consume::Consume1),
+            (
+                Token::Delimiter(Delimiter::Newline),
+                Some(Token::SequenceEndSquare | Token::Comment(..)),
+            ) => (None, Consume::Consume1),
+            (Token::Delimiter(Delimiter::Newline), _) => {
+                return Err(ParserError::MissingCommaInList(span.start))
+            }
+            (Token::SequenceEndSquare, _) => {
+                self.stack.pop();
+                Event::EndSequence(span).consume1()
+            }
+            (Token::Merge(anchor), _) => {
+                (Some(Event::Merge(anchor.in_span(span))), Consume::Consume1)
+            }
+            _ => {
+                return Self::do_parse_value(
+                    ((token, span), next),
+                    &mut self.pending_anchor,
+                    &mut self.stack,
+                )
+            }
+        })
+    }
+
+    fn parse_parens_sequence_item(&mut self) -> Result<(Option<Event>, Consume), ParserError> {
+        let state = match self.stack.last_mut() {
+            Some(ParserState::ParensSequence(state)) => state,
+            _ => panic!("inconsistent parser state"),
+        };
+
+        let [Some((token, span)), next] = self.lookahead.peek2() else {
+            return Err(ParserError::UnclosedDelimiter(
+                TokenType::SequenceStartSquare,
+                state.start.start,
+            ));
+        };
+
+        Ok(match (token, next.map(|(t, _)| t)) {
+            (Token::Delimiter(Delimiter::Comma), _) => (None, Consume::Consume1),
+            (
+                Token::Delimiter(Delimiter::Newline),
+                Some(Token::SequenceEndParens | Token::Comment(..)),
+            ) => (None, Consume::Consume1),
+            (Token::Delimiter(Delimiter::Newline), _) => {
+                return Err(ParserError::MissingCommaInList(span.start))
+            }
+            (Token::SequenceEndParens, _) => {
+                self.stack.pop();
+                Event::EndSequence(span).consume1()
+            }
+            (Token::Merge(anchor), _) => {
+                (Some(Event::Merge(anchor.in_span(span))), Consume::Consume1)
+            }
+            _ => {
+                return Self::do_parse_value(
+                    ((token, span), next),
+                    &mut self.pending_anchor,
+                    &mut self.stack,
+                )
+            }
+        })
+    }
+
+    fn do_parse_value<'r>(
+        ((token, span), next): ((Token<'r>, Span), Option<(Token<'r>, Span)>),
+        pending_anchor: &'r mut PendingAnchor,
+        stack: &mut Vec<ParserState>,
+    ) -> Result<(Option<Event<'r>>, Consume), ParserError> {
+        match (token, next.map(|(t, _)| t)) {
+            (Token::Anchor(_), None) => return Err(ParserError::TrailingAnchor(span.start)),
+            (
+                Token::Anchor(_),
+                Some(Token::SequenceEndCurly | Token::SequenceEndSquare | Token::SequenceEndParens),
+            ) => {
+                return Err(ParserError::TrailingAnchor(span.start));
+            }
+            (Token::Anchor(_), Some(Token::Ref(_) | Token::Merge(_))) => {
+                return Err(ParserError::ReferenceWithAnchor(span.start));
+            }
+            (Token::Anchor(tag), Some(_)) => {
+                if pending_anchor.is_some() {
+                    return Err(ParserError::MultipleAnchors(span.start));
+                }
+                stack.push(ParserState::TaggedValue(TaggedValueState {}));
+                pending_anchor.set(tag, span);
+                return Ok((None, Consume::Consume1));
+            }
+
+            _ => (),
+        }
+
+        Self::do_parse_untagged_value(((token, span), next), pending_anchor, stack)
+    }
+
+    fn parse_value_after_tag_anchor(&mut self) -> Result<(Option<Event>, Consume), ParserError> {
+        match self.stack.pop() {
+            Some(ParserState::TaggedValue(_)) => (),
+            _ => panic!("inconsistent parser state"),
+        };
+
+        self.parse_untagged_value()
+    }
+
+    fn parse_untagged_value(&mut self) -> Result<(Option<Event>, Consume), ParserError> {
+        let [Some((token, span)), next] = self.lookahead.peek2() else {
+            unreachable!("eof not handled in parent parser");
+        };
+
+        Self::do_parse_untagged_value(
+            ((token, span), next),
+            &mut self.pending_anchor,
+            &mut self.stack,
+        )
+    }
+
+    // Implementation of `parse_untagged_value`. This is just here to work
+    // around the borrow checker. Will be fixed with polonius.
+    fn do_parse_untagged_value<'r>(
+        ((token, span), next): ((Token<'r>, Span), Option<(Token<'r>, Span)>),
+        pending_anchor: &'r mut PendingAnchor,
+        stack: &mut Vec<ParserState>,
+    ) -> Result<(Option<Event<'r>>, Consume), ParserError> {
+        Ok(match (token, next) {
+            // Bare sequences.
+            (Token::SequenceStartCurly, _) => {
+                stack.push(ParserState::CurlySequence(CurlySequenceState {
+                    start: span,
+                    ..Default::default()
+                }));
+                Event::BeginMapping {
+                    span,
+                    type_tag: None,
+                    anchor: pending_anchor.take(),
+                }
+                .consume1()
+            }
+            (Token::SequenceStartSquare, _) => {
+                stack.push(ParserState::SquareSequence(SquareSequenceState {
+                    start: span,
+                    ..Default::default()
+                }));
+                Event::BeginSequence {
+                    span,
+                    style: SequenceStyle::List,
+                    type_tag: None,
+                    anchor: pending_anchor.take(),
+                }
+                .consume1()
+            }
+            (Token::SequenceStartParens, _) => {
+                stack.push(ParserState::ParensSequence(ParensSequenceState {
+                    start: span,
+                    ..Default::default()
+                }));
+                Event::BeginSequence {
+                    span,
+                    style: SequenceStyle::Tuple,
+                    type_tag: None,
+                    anchor: pending_anchor.take(),
+                }
+                .consume1()
+            }
+            // Type-tagged sequences.
+            (Token::Scalar(scalar), Some((Token::SequenceStartCurly, start_span))) => {
+                stack.push(ParserState::CurlySequence(CurlySequenceState {
+                    start: start_span,
+                    ..Default::default()
+                }));
+                Event::BeginMapping {
+                    span: start_span,
+                    type_tag: Some(scalar.in_span(span)),
+                    anchor: pending_anchor.take(),
+                }
+                .consume2()
+            }
+            (Token::Scalar(scalar), Some((Token::SequenceStartSquare, start_span))) => {
+                stack.push(ParserState::SquareSequence(SquareSequenceState {
+                    start: start_span,
+                    ..Default::default()
+                }));
+                Event::BeginSequence {
+                    span: start_span,
+                    style: SequenceStyle::List,
+                    type_tag: Some(scalar.in_span(span)),
+                    anchor: pending_anchor.take(),
+                }
+                .consume2()
+            }
+            (Token::Scalar(scalar), Some((Token::SequenceStartParens, start_span))) => {
+                stack.push(ParserState::ParensSequence(ParensSequenceState {
+                    start: start_span,
+                    ..Default::default()
+                }));
+                Event::BeginSequence {
+                    span: start_span,
+                    style: SequenceStyle::Tuple,
+                    type_tag: Some(scalar.in_span(span)),
+                    anchor: pending_anchor.take(),
+                }
+                .consume2()
+            }
+            // Bare scalars.
+            (Token::Scalar(scalar), _) => Event::Scalar(
+                scalar
+                    .with_anchor(pending_anchor.take().map(Spanned::into_inner))
+                    .in_span(span),
+            )
+            .consume1(),
+            // References
+            (Token::Ref(anchor), _) => Event::Ref(anchor.in_span(span)).consume1(),
+            (unexpected, _) => {
+                return Err(ParserError::UnexpectedToken(unexpected.ty(), span.start))
+            }
+        })
+    }
+}
+
+#[derive(Default)]
+struct CurlySequenceState {
+    start: Span,
+    parsing_kv_value: bool,
+    next_is_key: bool,
+    did_parse_colon: bool,
+    need_delimiter: bool,
+}
+
+#[derive(Default)]
+struct SquareSequenceState {
+    start: Span,
+}
+
+#[derive(Default)]
+struct ParensSequenceState {
+    start: Span,
+}
+
+#[derive(Default)]
+struct TaggedValueState {}
+
+#[derive(Default)]
+struct Lookahead {
+    cached: [CachedToken; 2],
+    eof: bool,
+}
+
+impl Lookahead {
+    pub fn peek2(&self) -> [Option<(Token, Span)>; 2] {
+        [self.cached[0].get(), self.cached[1].get()]
+    }
+
+    pub fn set_next(&mut self, token: Option<Spanned<Token>>) {
+        if token.is_none() {
+            self.eof = true;
+        } else {
+            assert!(!self.eof, "set_next(Some(...)) after eof");
+        }
+        self.cached.swap(0, 1);
+        self.cached[1].set(token);
+    }
+}
+
+trait Consuming {
+    fn consume1(self) -> (Option<Self>, Consume)
+    where
+        Self: Sized,
+    {
+        (Some(self), Consume::Consume1)
+    }
+    fn consume2(self) -> (Option<Self>, Consume)
+    where
+        Self: Sized,
+    {
+        (Some(self), Consume::Consume2)
+    }
+}
+
+impl<T> Consuming for T {}
+
+#[derive(Default)]
+struct PendingAnchor {
+    buf: String,
+    span: Option<Span>,
+}
+
+impl PendingAnchor {
+    #[inline]
+    fn take(&mut self) -> Option<Spanned<&str>> {
+        self.span.take().map(|span| self.buf.as_str().in_span(span))
+    }
+
+    #[inline]
+    fn set(&mut self, value: &str, span: Span) {
+        assert!(self.span.is_none());
+        self.buf.clear();
+        self.buf.push_str(value);
+        self.span = Some(span);
+    }
+
+    #[inline]
+    fn is_some(&self) -> bool {
+        self.span.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Scalar, ScalarStyle};
+
+    use super::*;
+
+    #[track_caller]
+    fn assert_events_eq(input: &str, expected: &[Event]) {
+        let mut parser = ParseStream::new(input.as_bytes());
+        let mut events = vec![];
+        loop {
+            match parser.next_event() {
+                Ok(Some(event)) => events.push(event.to_owned()),
+                Ok(None) => break,
+                Err(e) => panic!("error: {}", e),
+            }
+        }
+        assert_eq!(events, expected);
+    }
+
+    #[track_caller]
+    fn assert_events_err(input: &str, expected: ParserError) {
+        let mut parser = ParseStream::new(input.as_bytes());
+        let mut events = vec![];
+        loop {
+            match parser.next_event() {
+                Ok(Some(event)) => events.push(event.to_owned()),
+                Ok(None) => break,
+                Err(e) => {
+                    assert_eq!(e, expected);
+                    return;
+                }
+            }
+        }
+
+        panic!("did not get an error, expected {expected:?}")
+    }
+
+    #[test]
+    fn single_scalar() {
+        assert_events_eq("foo", &[Event::empty(), Event::plain("foo")]);
+    }
+
+    #[test]
+    fn two_scalars() {
+        assert_events_err(
+            "foo bar",
+            ParserError::UnexpectedToken(
+                TokenType::Scalar(ScalarStyle::Plain),
+                SourceLocation {
+                    offset: 4,
+                    line: 0,
+                    column: 4,
+                },
+            ),
+        );
+    }
+
+    #[test]
+    fn type_tagged_sequence() {
+        assert_events_eq(
+            "foo {}",
+            &[
+                Event::empty(),
+                Event::begin_mapping(Some("foo"), None),
+                Event::end_mapping(),
+            ],
+        );
+
+        assert_events_eq(
+            "foo []",
+            &[
+                Event::empty(),
+                Event::begin_sequence(SequenceStyle::List, Some("foo"), None),
+                Event::end_sequence(),
+            ],
+        );
+
+        assert_events_eq(
+            "foo()",
+            &[
+                Event::empty(),
+                Event::begin_sequence(SequenceStyle::Tuple, Some("foo"), None),
+                Event::end_sequence(),
+            ],
+        );
+    }
+
+    #[test]
+    fn two_kv_pairs() {
+        assert_events_eq(
+            "foo: bar\nbaz: qux\n\r\n\n\n",
+            &[
+                Event::plain("foo"),
+                Event::plain("bar"),
+                Event::plain("baz"),
+                Event::plain("qux"),
+            ],
+        );
+    }
+
+    #[test]
+    fn complex() {
+        const INPUT: &str = r#"
+    "normal item"
+    "key": value
+
+    {
+        1: 2
+
+        Object {
+            "key": value
+        }
+
+        List [
+            1.0,
+            2.0,
+            3.0,
+            &ref,
+        ]
+
+        @anchor Enum(hello, world)
+
+        *merge
+    }
+            "#;
+
+        assert_events_eq(
+            INPUT,
+            &[
+                Event::empty(), // implicit empty key
+                Event::quoted("normal item"),
+                Event::quoted("key"),
+                Event::plain("value"),
+                Event::empty(), // implicit empty key
+                Event::begin_mapping(None, None),
+                Event::plain("1"),
+                Event::plain("2"),
+                Event::empty(), // implicit empty key
+                Event::begin_mapping(Some("Object"), None),
+                Event::quoted("key"),
+                Event::plain("value"),
+                Event::end_mapping(),
+                Event::empty(), // implicit empty key
+                Event::begin_sequence(SequenceStyle::List, Some("List"), None),
+                Event::plain("1.0"),
+                Event::plain("2.0"),
+                Event::plain("3.0"),
+                Event::reference("ref"),
+                Event::end_sequence(),
+                Event::empty(), // implicit empty key
+                Event::begin_sequence(SequenceStyle::Tuple, Some("Enum"), Some("anchor")),
+                Event::plain("hello"),
+                Event::plain("world"),
+                Event::end_sequence(),
+                Event::merge("merge"),
+                Event::end_mapping(),
+            ],
+        );
+    }
+
+    #[test]
+    fn complex_anchors() {
+        let input = r#"
+            ? @baz baz: @forty-two 42
+        "#;
+
+        assert_events_eq(
+            input,
+            &[
+                Event::scalar(Scalar::plain("baz").with_anchor("baz")),
+                Event::scalar(Scalar::plain("42").with_anchor("forty-two")),
+            ],
+        )
+    }
+}

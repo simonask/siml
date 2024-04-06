@@ -1,0 +1,81 @@
+# Comments are prefixed with a '#', and go until the newline.
+
+# Identifier-style keys and values (no spaces)
+kv_notation: value
+
+# Identifier-style keys AND values (both are scalars)
+implicit_quote: value
+
+# Quoted keys are also scalars.
+"string_key": 123.0
+
+# Values can exist in mappings without a key. Mappings are also sequences.
+"implicit_value_without_key (must be quoted)"
+
+# Use curly brackets for a newline-separated sequence.
+{
+    "sequences do not need a key"
+}
+
+# Use square brackets for a comma-separated sequence where keys are disallowed
+inline_sequence: [1, 2, 3, 4]
+
+multiline_string: "
+Hello, World!
+"
+
+multiline_string_escape_newlines: "\
+Hello, World!\
+"
+
+multiline_string_with_whitspace_trimming: -"
+    "Hello, World!"
+"-
+
+# Indentation trimming: Leading newlines are trimmed, and each line has leading
+# spaces trimming equal to the indentation of the first line.
+multiline_string_with_indent_trimming: |"
+    Hello, World!
+"|
+
+# Multiline strings can be keys:
+|"
+    String key
+": 123.0
+
+# Any value may be preceded by an @anchor tag
+reusable_value @anchor {
+    key: value
+}
+
+# A value may be referenced as-is by `&anchor`
+reused_value &anchor
+
+# A tagged sequence can be merged into another sequence by `*anchor`
+merged_value {
+    *anchor
+    key2: value2
+}
+
+{
+    key: 1.23
+    key: "Hello"      # Duplicate keys are allowed
+
+    # Values can exist in sequences without keys, but must be quoted.
+    "Hello, World!"
+
+    # An identifier followed by `{ .. }`, `[ .. ]`, or `( .. )` becomes a
+    # "type-tagged" value.
+    MyObject {
+        a: Hello
+        b: "Hello, World!"
+    }
+
+    # Complex keys must be prefixed with `?`, similar to YAML:
+    ? MyKey {
+        a: Hello
+    }
+    : MyValue {
+        b: Hello
+    }
+}
