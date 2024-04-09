@@ -331,83 +331,52 @@ impl<'a> ScalarEmitter<'a> {
     }
 }
 
-fn escape_char(ch: char, writer: &mut impl std::fmt::Write) -> Result<(), std::fmt::Error> {
-    match ch {
-        '\x00' => writer.write_str("\\0"),
-        '\x07' => writer.write_str("\\a"),
-        '\x08' => writer.write_str("\\b"),
-        '\x09' => writer.write_str("\\t"),
-        '\x0a' => writer.write_str("\\n"),
-        '\x0b' => writer.write_str("\\v"),
-        '\x0c' => writer.write_str("\\f"),
-        '\x0d' => writer.write_str("\\r"),
-        '\\' => writer.write_str("\\\\"),
-        ch => write!(writer, "\\u{:04x}", ch as u32),
-    }
-}
-
 fn write_dquoted_scalar(
     value: &str,
-    writer: &mut impl std::fmt::Write,
+    mut writer: &mut impl std::fmt::Write,
 ) -> Result<(), std::fmt::Error> {
     writer.write_char('"')?;
     for ch in value.chars() {
-        match ch {
-            '"' => writer.write_str("\\\"")?,
-            ch if ch.must_escape_dquote() => escape_char(ch, writer)?,
-            ch => writer.write_char(ch)?,
-        }
+        ch.escape_quoted(&mut writer, '"')?;
     }
     writer.write_char('"')
 }
 
 fn write_squoted_scalar(
     value: &str,
-    writer: &mut impl std::fmt::Write,
+    mut writer: &mut impl std::fmt::Write,
 ) -> Result<(), std::fmt::Error> {
     writer.write_char('\'')?;
     for ch in value.chars() {
-        match ch {
-            '\'' => writer.write_str("\\\'")?,
-            ch if ch.must_escape_squote() => escape_char(ch, writer)?,
-            ch => writer.write_char(ch)?,
-        }
+        ch.escape_quoted(&mut writer, '\'')?;
     }
     writer.write_char('\'')
 }
 
 fn write_single_line_block_scalar(
     value: &str,
-    writer: &mut impl std::fmt::Write,
+    mut writer: &mut impl std::fmt::Write,
     indent: usize,
 ) -> Result<(), std::fmt::Error> {
     writer.write_str("-\"")?;
     write_newline(writer, indent + 1)?;
     for ch in value.chars() {
-        match ch {
-            '"' => writer.write_str("\\\"")?,
-            ch if ch.must_escape_dquote() => escape_char(ch, writer)?,
-            ch => writer.write_char(ch)?,
-        }
+        ch.escape_quoted(&mut writer, '"')?;
     }
-    write_newline(writer, indent)?;
+    write_newline(&mut writer, indent)?;
     writer.write_char('"')
 }
 
 fn write_multiline_block_scalar(
     value: &str,
-    writer: &mut impl std::fmt::Write,
+    mut writer: &mut impl std::fmt::Write,
     indent: usize,
 ) -> Result<(), std::fmt::Error> {
     writer.write_str("|\"")?;
     for line in value.lines() {
         write_newline(writer, indent + 1)?;
         for ch in line.chars() {
-            match ch {
-                '"' => writer.write_str("\\\"")?,
-                ch if ch.must_escape_dquote() => escape_char(ch, writer)?,
-                ch => writer.write_char(ch)?,
-            }
+            ch.escape_quoted(&mut writer, '"')?;
         }
     }
     write_newline(writer, indent)?;
@@ -436,7 +405,6 @@ impl<'a> LargeMappingBodyEmitter<'a> {
 
             if let Some(key_node) = key_node {
                 self.write_key(key_node, writer)?;
-                self.write_pending_newlines(writer)?;
             }
 
             self.write_value(value_node, writer)?;
