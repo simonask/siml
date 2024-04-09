@@ -1,8 +1,12 @@
-use std::{collections::HashMap, io::BufRead, num::NonZeroUsize};
+use std::{
+    collections::{hash_map, HashMap, HashSet},
+    io::BufRead,
+    num::NonZeroUsize,
+};
 
 use crate::{
-    Builder, Error, MappingBuilder, OwnedScalar, ParseStream, Scalar, ScalarStyle, Sequence,
-    SequenceStyle, Span, Spanned, SpannedExt, SpannedSequence, SpannedValue, Value,
+    Builder, BuilderError, Error, MappingBuilder, OwnedScalar, ParseStream, Scalar, ScalarStyle,
+    Sequence, SequenceStyle, Span, Spanned, SpannedExt, SpannedSequence, SpannedValue, Value,
 };
 
 pub struct Document {
@@ -10,6 +14,8 @@ pub struct Document {
     pub(crate) sequence: SequenceNode,
     pub(crate) anchors: HashMap<String, NodeId>,
     pub(crate) span: Span,
+    incomplete_sequences: HashSet<NodeId>,
+    incomplete_anchors: HashSet<String>,
 }
 
 impl Default for Document {
@@ -23,6 +29,8 @@ impl Default for Document {
             },
             anchors: HashMap::default(),
             span: Span::default(),
+            incomplete_sequences: HashSet::default(),
+            incomplete_anchors: HashSet::default(),
         }
     }
 }
@@ -310,6 +318,316 @@ impl Document {
         std::mem::drop(mapping_builder);
         builder.build().map_err(Into::into)
     }
+
+    pub(crate) fn set_anchor(
+        &mut self,
+        id: NodeId,
+        anchor: Option<String>,
+    ) -> Result<(), BuilderError> {
+        let Some(anchor) = anchor else { return Ok(()) };
+
+        match self.anchors.entry(anchor.clone()) {
+            hash_map::Entry::Occupied(entry) => {
+                return Err(BuilderError::DuplicateAnchor(entry.key().clone()));
+            }
+            hash_map::Entry::Vacant(entry) => {
+                if self.incomplete_anchors.contains(entry.key()) {
+                    return Err(BuilderError::DuplicateAnchor(entry.key().clone()));
+                }
+                entry.insert(id);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn add_spanned_scalar(
+        &mut self,
+        scalar: Spanned<OwnedScalar>,
+    ) -> Result<NodeId, BuilderError> {
+        let node_id = NodeId(NonZeroUsize::new(self.nodes.len() + 1).unwrap());
+
+        self.set_anchor(node_id, scalar.anchor.clone())?;
+
+        self.nodes.push(Node {
+            anchor: scalar
+                .anchor
+                .clone()
+                .map(|anchor| anchor.to_owned().in_span(Span::default())),
+            data: NodeData::Scalar(scalar.value.to_owned()),
+            span: scalar.span,
+        });
+
+        Ok(node_id)
+    }
+
+    /// Add a scalar to the document, inferring the best style based on its contents.
+    ///
+    /// See also [`add_scalar()`].
+    #[inline]
+    pub fn add_scalar_infer_style(
+        &mut self,
+        value: &str,
+        anchor: Option<&str>,
+    ) -> Result<NodeId, BuilderError> {
+        self.add_spanned_scalar(
+            Scalar::infer_style(value)
+                .with_anchor(anchor)
+                .to_owned()
+                .in_span(Span::default()),
+        )
+    }
+
+    /// Add a scalar node to the document.
+    ///
+    /// Note: This does not insert the scalar anywhere in the document's node
+    /// hierarchy. It must still be added to a sequence or mapping, or the
+    /// document root mapping.
+    ///
+    /// This function's purpose is to support higher-level builder APIs.
+    ///
+    /// Use [`Builder`](crate::Builder) to have these details handled
+    /// automatically.
+    #[inline]
+    pub fn add_scalar(&mut self, scalar: Scalar) -> Result<NodeId, BuilderError> {
+        self.add_spanned_scalar(scalar.to_owned().in_span(Span::default()))
+    }
+
+    pub(crate) fn add_spanned_sequence(
+        &mut self,
+        style: SequenceStyle,
+        anchor: Option<Spanned<String>>,
+        type_tag: Option<NodeId>,
+        span: Span,
+    ) -> Result<NodeId, BuilderError> {
+        let node_id = NodeId(NonZeroUsize::new(self.nodes.len() + 1).unwrap());
+
+        if let Some(tag) = anchor.clone().map(Spanned::into_inner) {
+            self.set_anchor(node_id, Some(tag.to_owned()))?;
+            self.incomplete_anchors.insert(tag.to_owned());
+        }
+        self.incomplete_sequences.insert(node_id);
+
+        self.nodes.push(Node {
+            anchor,
+            data: NodeData::Sequence(SequenceNode {
+                style,
+                type_tag,
+                items: vec![],
+            }),
+            span,
+        });
+
+        Ok(node_id)
+    }
+
+    /// Add a sequence or mapping node to the document.
+    ///
+    /// When the sequence is done being built, `complete_sequence()` must be
+    /// called.
+    ///
+    /// Note: This does not insert the sequence anywhere in the document's node
+    /// hierarchy. It must still be added to a sequence or mapping, or the
+    /// document root mapping.
+    ///
+    /// Note: If the sequence has an anchor, the anchor cannot be referenced
+    /// before `complete_sequence()` is called.
+    ///
+    /// This function's purpose is to support higher-level builder APIs.
+    ///
+    /// Use [`Builder`](crate::Builder) to have these details handled
+    /// automatically.
+    #[inline]
+    pub fn add_sequence(
+        &mut self,
+        style: SequenceStyle,
+        anchor: Option<&str>,
+        type_tag: Option<NodeId>,
+    ) -> Result<NodeId, BuilderError> {
+        self.add_spanned_sequence(style, None, None, Span::default())
+    }
+
+    /// Complete a previously added sequence.
+    ///
+    /// After calling this, the sequence becomes immutable, and can be
+    /// referenced by other nodes.
+    ///
+    /// See [`add_sequence()`].
+    pub fn complete_sequence(&mut self, node: NodeId) {
+        self.incomplete_sequences.remove(&node);
+        if let Some(tag) = self.nodes[node].anchor.as_ref() {
+            let removed = self.incomplete_anchors.remove(tag.value.as_str());
+            assert!(removed, "anchor was not marked as incomplete; perhaps this NodeId is a scalar, or it belongs to a different document?");
+        }
+    }
+
+    /// Add a node as the child of a sequence.
+    ///
+    /// If `seq` is None, the key-value pair is added to the document's root.
+    ///
+    /// If `key_node` is None, the value is added as a "keyless" item in a
+    /// mapping, or as a regular element in a list/tuple. This function may be
+    /// called with any type of sequence node (lists, tuples, and mappings).
+    pub fn add_sequence_item(
+        &mut self,
+        seq: Option<NodeId>,
+        key_node: Option<NodeId>,
+        value_node: NodeId,
+    ) {
+        if key_node.is_some_and(|key_node| self.incomplete_sequences.contains(&key_node)) {
+            panic!("cannot use an incomplete sequence as a key in a mapping");
+        }
+        if self.incomplete_sequences.contains(&value_node) {
+            panic!("cannot add an incomplete node to another mapping or sequence");
+        }
+
+        if let Some(seq) = seq {
+            if !self.incomplete_sequences.contains(&seq) {
+                panic!("cannot add nodes to sequences that have already been completed");
+            }
+
+            if let NodeData::Sequence(ref mut seq) = self.nodes[seq].data {
+                seq.items.push(SequenceItem {
+                    key_node,
+                    value_node,
+                });
+            } else {
+                panic!("not a sequence node")
+            }
+        } else {
+            self.sequence.items.push(SequenceItem {
+                key_node,
+                value_node,
+            })
+        }
+    }
+
+    /// Check that there are no incomplete sequences in the document.
+    ///
+    /// Missing calls to `complete_sequence()` is considered a logic error, and
+    /// this function may panic instead of returning a `BuilderError`.
+    pub fn check_complete(&self) -> Result<(), BuilderError> {
+        if let Some(incomplete) = self.incomplete_anchors.iter().next() {
+            return Err(BuilderError::IncompleteAnchor(incomplete.clone()));
+        }
+        if let Some(incomplete) = self.incomplete_sequences.iter().next() {
+            panic!("add_sequence() was called without a corresponding call to complete_sequence()");
+        }
+        Ok(())
+    }
+
+    /// Add any value to the document.
+    ///
+    /// Note: This does not insert the value anywhere in the document's node
+    /// hierarchy. It must still be added to a sequence or mapping, or the
+    /// document root mapping.
+    ///
+    /// If an error occurs while inserting values (such as if a duplicate anchor
+    /// exists), the document will be left in the same state as before this
+    /// call. In other words, composite values will not be partially inserted.
+    ///
+    /// This function's purpose is to support higher-level builder APIs.
+    ///
+    /// Use [`Builder`](crate::Builder) to have these details handled
+    /// automatically.
+    pub fn add_value(&mut self, value: &Value) -> Result<NodeId, BuilderError> {
+        match value {
+            Value::Scalar(scalar) => self.add_scalar(*scalar),
+            Value::Sequence(seq) => {
+                let type_tag = seq.type_tag.map(|t| self.add_scalar(t)).transpose()?;
+                let id = self.add_sequence(seq.style, seq.anchor, type_tag)?;
+                let mut err = None;
+                for (k, v) in seq.items.iter() {
+                    let key_node = if let Some(k) = k {
+                        match self.add_value(k) {
+                            Ok(key_node) => Some(key_node),
+                            Err(e) => {
+                                err = Some(e);
+                                break;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let value_node = match self.add_value(v) {
+                        Ok(value_node) => value_node,
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    };
+                    self.add_sequence_item(Some(id), key_node, value_node);
+                }
+                self.complete_sequence(id);
+                if let Some(err) = err {
+                    self.remove_from(id);
+                    Err(err)
+                } else {
+                    Ok(id)
+                }
+            }
+        }
+    }
+
+    fn remove_from(&mut self, id: NodeId) {
+        self.nodes.splice(id.0.get() - 1.., []);
+    }
+
+    /// Get the node ID for the given anchor.
+    ///
+    /// This function returns an error if the anchor is not defined, or if the
+    /// anchor refers to an incomplete sequence.
+    pub fn resolve_anchor(&self, anchor: &str) -> Result<NodeId, BuilderError> {
+        if self.incomplete_anchors.contains(anchor) {
+            return Err(BuilderError::IncompleteAnchor(anchor.to_owned()));
+        }
+        if let Some(node) = self.anchors.get(anchor) {
+            Ok(*node)
+        } else {
+            Err(BuilderError::UndefinedAnchor(anchor.to_owned()))
+        }
+    }
+
+    /// Given two sequence nodes, copy all items from one to the other.
+    ///
+    /// If `into` is None, the items from `from` are copied into the document's
+    /// root.
+    pub fn merge_nodes(&mut self, into: Option<NodeId>, from: NodeId) {
+        assert_ne!(into, Some(from), "cannot merge a node into itself");
+        if self.incomplete_sequences.contains(&from) {
+            panic!("cannot merge an incomplete sequence into another sequence");
+        }
+
+        let (src, dst) = if let Some(target) = into {
+            // TODO: Replace this with slice::get_many_mut when stablex
+            let src_idx = from.0.get() - 1;
+            let dst_idx = target.0.get() - 1;
+            let (src, dst_node) = if src_idx < dst_idx {
+                let (lower, upper) = self.nodes.split_at_mut(dst_idx);
+                (&mut lower[src_idx], &mut upper[0])
+            } else {
+                let (lower, upper) = self.nodes.split_at_mut(src_idx);
+                (&mut upper[0], &mut lower[dst_idx])
+            };
+            if let NodeData::Sequence(dst_seq) = &mut dst_node.data {
+                (src, dst_seq)
+            } else {
+                panic!("cannot merge into non-sequence")
+            }
+        } else {
+            (&mut self.nodes[from], &mut self.sequence)
+        };
+
+        if let NodeData::Sequence(src_seq) = &src.data {
+            for item in src_seq.items.iter() {
+                dst.items.push(item.clone());
+            }
+        } else {
+            dst.items.push(SequenceItem {
+                key_node: None,
+                value_node: from,
+            });
+        }
+    }
 }
 
 impl PartialEq<Value<'_>> for Document {
@@ -330,6 +648,9 @@ impl PartialEq<SpannedValue<'_>> for Document {
     }
 }
 
+/// The ID of a node in a document.
+///
+/// Node IDs are only valid for a particular document, and cannot be reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[doc(hidden)]
 pub struct NodeId(pub(crate) NonZeroUsize);

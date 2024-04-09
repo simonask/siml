@@ -1,13 +1,8 @@
-use std::{
-    collections::{hash_map, HashSet},
-    io::BufRead,
-    num::NonZeroUsize,
-};
+use std::io::BufRead;
 
 use crate::{
-    Document, Error, Node, NodeData, NodeId, OwnedEvent, OwnedScalar, ParseStream, ScalarStyle,
-    ScannerError, SequenceItem, SequenceNode, SequenceStyle, Span, Spanned, SpannedExt,
-    SpannedValue, Value,
+    Document, Error, NodeData, NodeId, OwnedEvent, OwnedScalar, ParseStream, Scalar, ScalarStyle,
+    ScannerError, SequenceItem, SequenceNode, SequenceStyle, Spanned, SpannedExt, Value,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -35,253 +30,21 @@ pub enum BuilderError {
 #[derive(Default)]
 pub struct Builder {
     doc: Document,
-    incomplete_sequences: HashSet<NodeId>,
-    incomplete_anchors: HashSet<String>,
 }
 
 impl Builder {
-    fn set_anchor(&mut self, node_id: NodeId, tag: Option<String>) -> Result<(), BuilderError> {
-        let Some(tag) = tag else { return Ok(()) };
-
-        match self.doc.anchors.entry(tag.clone()) {
-            hash_map::Entry::Occupied(entry) => {
-                return Err(BuilderError::DuplicateAnchor(entry.key().clone()));
-            }
-            hash_map::Entry::Vacant(entry) => {
-                if self.incomplete_anchors.contains(entry.key()) {
-                    return Err(BuilderError::DuplicateAnchor(entry.key().clone()));
-                }
-                entry.insert(node_id);
-                Ok(())
-            }
-        }
-    }
-
-    fn add_spanned_scalar(&mut self, value: Spanned<OwnedScalar>) -> Result<NodeId, BuilderError> {
-        let node_id = NodeId(NonZeroUsize::new(self.doc.nodes.len() + 1).unwrap());
-
-        self.set_anchor(node_id, value.anchor.clone())?;
-
-        self.doc.nodes.push(Node {
-            anchor: value
-                .anchor
-                .clone()
-                .map(|anchor| anchor.in_span(Span::default())),
-            data: NodeData::Scalar(value.value),
-            span: value.span,
-        });
-
-        Ok(node_id)
-    }
-
-    #[inline]
-    pub(crate) fn add_scalar(&mut self, value: OwnedScalar) -> Result<NodeId, BuilderError> {
-        self.add_spanned_scalar(value.in_span(Span::default()))
-    }
-
-    #[inline]
-    pub(crate) fn add_scalar_infer_style(
-        &mut self,
-        value: &str,
-        anchor: Option<&str>,
-    ) -> Result<NodeId, BuilderError> {
-        self.add_spanned_scalar(
-            OwnedScalar::infer_style(value)
-                .with_anchor(anchor.map(ToOwned::to_owned))
-                .in_span(Span::default()),
-        )
-    }
-
-    fn add_spanned_sequence(
-        &mut self,
-        style: SequenceStyle,
-        anchor: Option<Spanned<String>>,
-        type_tag: Option<NodeId>,
-        span: Span,
-    ) -> Result<NodeId, BuilderError> {
-        let node_id = NodeId(NonZeroUsize::new(self.doc.nodes.len() + 1).unwrap());
-
-        if let Some(tag) = anchor.clone().map(Spanned::into_inner) {
-            self.set_anchor(node_id, Some(tag.clone()))?;
-            self.incomplete_anchors.insert(tag);
-        }
-        self.incomplete_sequences.insert(node_id);
-
-        self.doc.nodes.push(Node {
-            anchor,
-            data: NodeData::Sequence(SequenceNode {
-                style,
-                type_tag,
-                items: vec![],
-            }),
-            span,
-        });
-
-        Ok(node_id)
-    }
-
-    pub(crate) fn complete_sequence(&mut self, node: NodeId) {
-        self.incomplete_sequences.remove(&node);
-        if let Some(tag) = self.doc.nodes[node].anchor.as_ref() {
-            let removed = self.incomplete_anchors.remove(tag.value.as_str());
-            assert!(removed, "tag was not marked as incomplete");
-        }
-    }
-
-    pub(crate) fn add_sequence(
-        &mut self,
-        style: SequenceStyle,
-        anchor: Option<String>,
-        type_tag: Option<NodeId>,
-    ) -> Result<NodeId, BuilderError> {
-        self.add_spanned_sequence(
-            style,
-            anchor.map(|anchor| anchor.in_span(Span::default())),
-            type_tag,
-            Span::default(),
-        )
-    }
-
-    pub(crate) fn add_sequence_item(
-        &mut self,
-        seq: NodeId,
-        key_node: Option<NodeId>,
-        value_node: NodeId,
-    ) {
-        if let NodeData::Sequence(ref mut seq) = self.doc.nodes[seq].data {
-            seq.items.push(SequenceItem {
-                key_node,
-                value_node,
-            });
-        } else {
-            panic!("not a sequence node")
-        }
-    }
-
-    pub(crate) fn add_root_item(&mut self, key_node: Option<NodeId>, value_node: NodeId) {
-        self.doc.sequence.items.push(SequenceItem {
-            key_node,
-            value_node,
-        });
-    }
-
-    fn add_spanned_value(&mut self, value: SpannedValue) -> Result<NodeId, BuilderError> {
-        match value {
-            SpannedValue::Scalar(scalar) => {
-                self.add_spanned_scalar(scalar.map(|value| value.to_owned()))
-            }
-            SpannedValue::Sequence(seq) => {
-                let type_tag = seq
-                    .type_tag
-                    .map(|tag| self.add_scalar(tag.into_inner().into()))
-                    .transpose()?;
-                let node = self.add_spanned_sequence(
-                    seq.style,
-                    seq.anchor.map(|s| s.map(ToOwned::to_owned)),
-                    type_tag,
-                    seq.span,
-                )?;
-                let mut builder = MappingBuilder {
-                    node: Some(node),
-                    builder: self,
-                };
-                for (key, value) in seq.items {
-                    if let Some(key) = key {
-                        builder.entry(key, value)?;
-                    } else {
-                        builder.item(value)?;
-                    }
-                }
-                Ok(node)
-            }
-        }
-    }
-
-    fn add_value(&mut self, value: Value) -> Result<NodeId, BuilderError> {
-        match value {
-            Value::Scalar(ref scalar) => self.add_scalar((*scalar).to_owned()),
-            Value::Sequence(seq) => {
-                let type_tag = seq
-                    .type_tag
-                    .map(|tag| self.add_scalar(tag.to_owned()))
-                    .transpose()?;
-                let node =
-                    self.add_sequence(seq.style, seq.anchor.map(ToOwned::to_owned), type_tag)?;
-
-                let mut builder = MappingBuilder {
-                    node: Some(node),
-                    builder: self,
-                };
-                for (key, value) in seq.items {
-                    if let Some(key) = key {
-                        builder.entry(key, value)?;
-                    } else {
-                        builder.item(value)?;
-                    }
-                }
-                Ok(node)
-            }
-        }
-    }
-
-    fn resolve_tag(&self, anchor: &str) -> Result<NodeId, BuilderError> {
-        if self.incomplete_anchors.contains(anchor) {
-            return Err(BuilderError::IncompleteAnchor(anchor.to_owned()));
-        }
-        if let Some(node) = self.doc.anchors.get(anchor) {
-            Ok(*node)
-        } else {
-            Err(BuilderError::UndefinedAnchor(anchor.to_owned()))
-        }
-    }
-
     pub fn build(&mut self) -> Result<Document, BuilderError> {
-        if self.incomplete_sequences.is_empty() {
-            assert!(self.incomplete_anchors.is_empty());
-            Ok(std::mem::take(&mut self.doc))
-        } else {
-            panic!("Incomplete sequences in builder; perhaps you somehow called `forget(...)` on a sequence builder?")
-        }
+        self.doc.check_complete()?;
+        Ok(std::mem::take(&mut self.doc))
     }
 
     fn merge(&mut self, target: Option<NodeId>, anchor: &str) -> Result<(), BuilderError> {
-        let source = self.resolve_tag(anchor)?;
-        assert_ne!(target, Some(source), "cannot merge a node with itself");
-
-        let (src, dst) = if let Some(target) = target {
-            // TODO: Replace this with slice::get_many_mut when stable
-            let src_idx = source.0.get() - 1;
-            let dst_idx = target.0.get() - 1;
-            let (src, dst_node) = if src_idx < dst_idx {
-                let (lower, upper) = self.doc.nodes.split_at_mut(dst_idx);
-                (&mut lower[src_idx], &mut upper[0])
-            } else {
-                let (lower, upper) = self.doc.nodes.split_at_mut(src_idx);
-                (&mut upper[0], &mut lower[dst_idx])
-            };
-            if let NodeData::Sequence(dst_seq) = &mut dst_node.data {
-                (src, dst_seq)
-            } else {
-                panic!("cannot merge into non-sequence")
-            }
-        } else {
-            (&mut self.doc.nodes[source], &mut self.doc.sequence)
-        };
-
-        if let NodeData::Sequence(src_seq) = &src.data {
-            for item in src_seq.items.iter() {
-                dst.items.push(item.clone());
-            }
-        } else {
-            dst.items.push(SequenceItem {
-                key_node: None,
-                value_node: source,
-            });
-        }
-
+        let source = self.doc.resolve_anchor(anchor)?;
+        self.doc.merge_nodes(target, source);
         Ok(())
     }
 
+    /// Add a key-value entry to the root mapping.
     pub fn entry(
         &mut self,
         key: impl BuildValue,
@@ -296,6 +59,7 @@ impl Builder {
         Ok(self)
     }
 
+    /// Add an item without a key to the root mapping.
     pub fn item(&mut self, value: impl BuildValue) -> Result<&mut Self, BuilderError> {
         let value_node = value.build(None, None, self)?;
         self.doc.sequence.items.push(SequenceItem {
@@ -328,7 +92,7 @@ impl<'b> MappingBuilder<'b> {
         parser: &mut ParseStream<R>,
         is_root: bool,
     ) -> Result<(), Error> {
-        let mut pending_key: Option<NodeId> = None;
+        let mut pending_key: Option<Option<NodeId>> = None;
 
         loop {
             let Some(event) = parser.next_event()? else {
@@ -341,8 +105,8 @@ impl<'b> MappingBuilder<'b> {
             let event = event.to_owned();
 
             let key_or_value = match event {
-                OwnedEvent::Scalar(scalar) => self.builder.add_spanned_scalar(scalar)?,
-                OwnedEvent::Ref(anchor) => self.builder.resolve_tag(&anchor)?,
+                OwnedEvent::Scalar(scalar) => Some(self.builder.doc.add_spanned_scalar(scalar)?),
+                OwnedEvent::Ref(anchor) => Some(self.builder.doc.resolve_anchor(&anchor)?),
                 OwnedEvent::Merge(anchor) => {
                     if pending_key.is_some() {
                         return Err(BuilderError::UnexpectedEvent.into());
@@ -357,11 +121,12 @@ impl<'b> MappingBuilder<'b> {
                     anchor,
                 } => {
                     let type_tag = type_tag
-                        .map(|type_tag| self.builder.add_spanned_scalar(type_tag))
+                        .map(|type_tag| self.builder.doc.add_spanned_scalar(type_tag))
                         .transpose()?;
 
                     let seq_id = self
                         .builder
+                        .doc
                         .add_spanned_sequence(style, anchor, type_tag, span)?;
                     let mut seq_builder = SequenceBuilder {
                         inner: MappingBuilder {
@@ -370,7 +135,7 @@ impl<'b> MappingBuilder<'b> {
                         },
                     };
                     seq_builder.parse(parser)?;
-                    seq_id
+                    Some(seq_id)
                 }
                 OwnedEvent::EndSequence(_) => return Err(BuilderError::UnexpectedEvent.into()),
                 OwnedEvent::BeginMapping {
@@ -379,10 +144,10 @@ impl<'b> MappingBuilder<'b> {
                     anchor,
                 } => {
                     let type_tag = type_tag
-                        .map(|type_tag| self.builder.add_spanned_scalar(type_tag))
+                        .map(|type_tag| self.builder.doc.add_spanned_scalar(type_tag))
                         .transpose()?;
 
-                    let submap_id = self.builder.add_spanned_sequence(
+                    let submap_id = self.builder.doc.add_spanned_sequence(
                         SequenceStyle::Mapping,
                         anchor,
                         type_tag,
@@ -393,7 +158,7 @@ impl<'b> MappingBuilder<'b> {
                         builder: self.builder,
                     };
                     submap_builder.parse(parser, false)?;
-                    submap_id
+                    Some(submap_id)
                 }
                 OwnedEvent::EndMapping(_) => {
                     if pending_key.is_some() {
@@ -401,21 +166,24 @@ impl<'b> MappingBuilder<'b> {
                     }
                     return Ok(());
                 }
-                OwnedEvent::Empty(span) => self.builder.add_spanned_scalar(Spanned {
-                    value: OwnedScalar {
-                        style: ScalarStyle::Plain,
-                        value: String::new(),
-                        anchor: None,
-                    },
-                    span,
-                })?,
+                OwnedEvent::Empty(span) => {
+                    if pending_key.is_some() {
+                        Some(
+                            self.builder
+                                .doc
+                                .add_spanned_scalar(OwnedScalar::plain("").in_span(span))?,
+                        )
+                    } else {
+                        None
+                    }
+                }
                 OwnedEvent::Comment(_) => continue,
             };
 
             if let Some(key) = pending_key.take() {
                 self.seq().items.push(SequenceItem {
-                    key_node: Some(key),
-                    value_node: key_or_value,
+                    key_node: key,
+                    value_node: key_or_value.expect("no value for key"),
                 });
             } else {
                 pending_key = Some(key_or_value);
@@ -463,7 +231,7 @@ impl<'b> Drop for MappingBuilder<'b> {
     #[inline]
     fn drop(&mut self) {
         if let Some(node) = self.node {
-            self.builder.complete_sequence(node);
+            self.builder.doc.complete_sequence(node);
         }
     }
 }
@@ -477,8 +245,8 @@ impl<'b> SequenceBuilder<'b> {
             let event = event.to_owned();
 
             let value = match event {
-                OwnedEvent::Scalar(scalar) => self.inner.builder.add_spanned_scalar(scalar)?,
-                OwnedEvent::Ref(anchor) => self.inner.builder.resolve_tag(&anchor)?,
+                OwnedEvent::Scalar(scalar) => self.inner.builder.doc.add_spanned_scalar(scalar)?,
+                OwnedEvent::Ref(anchor) => self.inner.builder.doc.resolve_anchor(&anchor)?,
                 OwnedEvent::Merge(anchor) => {
                     self.inner.builder.merge(self.inner.node, &anchor)?;
                     continue;
@@ -490,12 +258,13 @@ impl<'b> SequenceBuilder<'b> {
                     anchor,
                 } => {
                     let type_tag = type_tag
-                        .map(|type_tag| self.inner.builder.add_spanned_scalar(type_tag))
+                        .map(|type_tag| self.inner.builder.doc.add_spanned_scalar(type_tag))
                         .transpose()?;
 
                     let seq_id = self
                         .inner
                         .builder
+                        .doc
                         .add_spanned_sequence(style, anchor, type_tag, span)?;
                     let mut seq_builder = SequenceBuilder {
                         inner: MappingBuilder {
@@ -516,10 +285,10 @@ impl<'b> SequenceBuilder<'b> {
                     anchor,
                 } => {
                     let type_tag = type_tag
-                        .map(|type_tag| self.inner.builder.add_spanned_scalar(type_tag))
+                        .map(|type_tag| self.inner.builder.doc.add_spanned_scalar(type_tag))
                         .transpose()?;
 
-                    let submap_id = self.inner.builder.add_spanned_sequence(
+                    let submap_id = self.inner.builder.doc.add_spanned_sequence(
                         SequenceStyle::Mapping,
                         anchor,
                         type_tag,
@@ -533,7 +302,7 @@ impl<'b> SequenceBuilder<'b> {
                     submap_id
                 }
                 OwnedEvent::EndMapping(_) => return Err(BuilderError::UnexpectedEvent.into()),
-                OwnedEvent::Empty(span) => self.inner.builder.add_spanned_scalar(Spanned {
+                OwnedEvent::Empty(span) => self.inner.builder.doc.add_spanned_scalar(Spanned {
                     value: OwnedScalar {
                         style: ScalarStyle::Plain,
                         value: String::new(),
@@ -643,7 +412,7 @@ impl<'a> BuildValue for &'a str {
         builder: &mut Builder,
     ) -> Result<NodeId, BuilderError> {
         assert!(type_tag.is_none());
-        builder.add_scalar_infer_style(self, anchor)
+        builder.doc.add_scalar_infer_style(self, anchor)
     }
 }
 
@@ -656,7 +425,7 @@ impl BuildValue for String {
         builder: &mut Builder,
     ) -> Result<NodeId, BuilderError> {
         assert!(type_tag.is_none());
-        builder.add_scalar_infer_style(&self, anchor)
+        builder.doc.add_scalar_infer_style(&self, anchor)
     }
 }
 
@@ -669,7 +438,9 @@ impl BuildValue for char {
         builder: &mut Builder,
     ) -> Result<NodeId, BuilderError> {
         assert!(type_tag.is_none());
-        builder.add_scalar_infer_style(&self.to_string(), anchor)
+        builder
+            .doc
+            .add_scalar_infer_style(&self.to_string(), anchor)
     }
 }
 
@@ -689,32 +460,9 @@ impl<'a> BuildValue for Value<'a> {
                     previous_anchor.to_owned(),
                 ));
             }
-            builder.add_value(self.with_anchor(anchor))
+            builder.doc.add_value(&self.with_anchor(anchor))
         } else {
-            builder.add_value(self)
-        }
-    }
-}
-
-impl<'a> BuildValue for SpannedValue<'a> {
-    #[inline]
-    fn build(
-        self,
-        anchor: Option<&str>,
-        type_tag: Option<&str>,
-        builder: &mut Builder,
-    ) -> Result<NodeId, BuilderError> {
-        assert!(type_tag.is_none());
-        if let Some(anchor) = anchor {
-            if let Some(previous_anchor) = self.anchor() {
-                return Err(BuilderError::MultipleAnchors(
-                    anchor.to_owned(),
-                    previous_anchor.to_owned(),
-                ));
-            }
-            builder.add_spanned_value(self.with_anchor(anchor))
-        } else {
-            builder.add_spanned_value(self)
+            builder.doc.add_value(&self)
         }
     }
 }
@@ -734,10 +482,10 @@ macro_rules! impl_int {
                 builder: &mut Builder,
             ) -> Result<NodeId, BuilderError> {
                 assert!(type_tag.is_none());
-                builder.add_scalar(OwnedScalar {
+                builder.doc.add_scalar(Scalar {
                     style: ScalarStyle::Plain,
-                    value: itoa::Buffer::new().format(self).to_string(),
-                    anchor: anchor.map(ToOwned::to_owned),
+                    value: itoa::Buffer::new().format(self),
+                    anchor,
                 })
             }
         }
@@ -761,10 +509,10 @@ macro_rules! impl_float {
                 builder: &mut Builder,
             ) -> Result<NodeId, BuilderError> {
                 assert!(type_tag.is_none());
-                builder.add_scalar(OwnedScalar {
+                builder.doc.add_scalar(Scalar {
                     style: ScalarStyle::Plain,
-                    value: ryu::Buffer::new().format(self).to_string(),
-                    anchor: anchor.map(ToOwned::to_owned),
+                    value: ryu::Buffer::new().format(self),
+                    anchor,
                 })
             }
         }
@@ -781,10 +529,10 @@ impl BuildValue for bool {
         builder: &mut Builder,
     ) -> Result<NodeId, BuilderError> {
         assert!(type_tag.is_none());
-        builder.add_scalar(OwnedScalar {
+        builder.doc.add_scalar(Scalar {
             style: ScalarStyle::Plain,
-            value: if self { "true" } else { "false" }.to_owned(),
-            anchor: anchor.map(ToOwned::to_owned),
+            value: if self { "true" } else { "false" },
+            anchor,
         })
     }
 }
@@ -804,11 +552,12 @@ where
         builder: &mut Builder,
     ) -> Result<NodeId, BuilderError> {
         let type_tag = type_tag
-            .map(|tag| builder.add_scalar(OwnedScalar::plain(tag)))
+            .map(|tag| builder.doc.add_scalar(Scalar::plain(tag)))
             .transpose()?;
 
-        let seq_id =
-            builder.add_sequence(SequenceStyle::List, anchor.map(ToOwned::to_owned), type_tag)?;
+        let seq_id = builder
+            .doc
+            .add_sequence(SequenceStyle::List, anchor, type_tag)?;
         let mut seq_builder = SequenceBuilder {
             inner: MappingBuilder {
                 node: Some(seq_id),
@@ -880,14 +629,12 @@ where
         builder: &mut Builder,
     ) -> Result<NodeId, BuilderError> {
         let type_tag = type_tag
-            .map(|tag| builder.add_scalar(OwnedScalar::plain(tag)))
+            .map(|tag| builder.doc.add_scalar(Scalar::plain(tag)))
             .transpose()?;
 
-        let seq_id = builder.add_sequence(
-            SequenceStyle::Tuple,
-            anchor.map(ToOwned::to_owned),
-            type_tag,
-        )?;
+        let seq_id = builder
+            .doc
+            .add_sequence(SequenceStyle::Tuple, anchor, type_tag)?;
         let mut seq_builder = SequenceBuilder {
             inner: MappingBuilder {
                 node: Some(seq_id),
@@ -924,14 +671,12 @@ where
         builder: &mut Builder,
     ) -> Result<NodeId, BuilderError> {
         let type_tag = type_tag
-            .map(|tag| builder.add_scalar(OwnedScalar::plain(tag)))
+            .map(|tag| builder.doc.add_scalar(Scalar::plain(tag)))
             .transpose()?;
 
-        let seq_id = builder.add_sequence(
-            SequenceStyle::Mapping,
-            anchor.map(ToOwned::to_owned),
-            type_tag,
-        )?;
+        let seq_id = builder
+            .doc
+            .add_sequence(SequenceStyle::Mapping, anchor, type_tag)?;
         let mut builder = MappingBuilder {
             node: Some(seq_id),
             builder,
@@ -980,12 +725,12 @@ macro_rules! impl_tuple {
                 let ($($t,)*) = self;
 
                 let type_tag = type_tag
-                .map(|tag| builder.add_scalar(OwnedScalar::plain(tag)))
+                .map(|tag| builder.doc.add_scalar(Scalar::plain(tag)))
                 .transpose()?;
 
-                let seq_id = builder.add_sequence(
+                let seq_id = builder.doc.add_sequence(
                     SequenceStyle::Tuple,
-                    anchor.map(ToOwned::to_owned),
+                    anchor,
                     type_tag,
                 )?;
                 let mut seq_builder = SequenceBuilder {
@@ -1033,13 +778,11 @@ where
         builder: &mut Builder,
     ) -> Result<NodeId, BuilderError> {
         let type_tag = type_tag
-            .map(|tag| builder.add_scalar(OwnedScalar::plain(tag)))
+            .map(|tag| builder.doc.add_scalar(Scalar::plain(tag)))
             .transpose()?;
-        let seq_id = builder.add_sequence(
-            SequenceStyle::Mapping,
-            anchor.map(ToOwned::to_owned),
-            type_tag,
-        )?;
+        let seq_id = builder
+            .doc
+            .add_sequence(SequenceStyle::Mapping, anchor, type_tag)?;
         let mut builder = MappingBuilder {
             node: Some(seq_id),
             builder,
