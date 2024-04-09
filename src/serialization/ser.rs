@@ -1,4 +1,4 @@
-use crate::{Builder, BuilderError, Document, NodeId, OwnedScalar, SequenceStyle};
+use crate::{Builder, BuilderError, Document, NodeId, OwnedScalar, Scalar, SequenceStyle};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SerializationError {
@@ -23,7 +23,7 @@ impl serde::ser::Error for SerializationError {
 
 #[derive(Default)]
 pub(super) struct RootSerializer {
-    builder: Builder,
+    doc: Document,
     pending_key: Option<NodeId>,
     tag_structs: bool,
 }
@@ -33,7 +33,8 @@ type Impossible = serde::ser::Impossible<RootSerializer, SerializationError>;
 impl RootSerializer {
     #[inline]
     pub fn finish(mut self) -> Result<Document, SerializationError> {
-        self.builder.build().map_err(Into::into)
+        self.doc.check_complete()?;
+        Ok(self.doc)
     }
 }
 
@@ -226,10 +227,10 @@ impl serde::ser::SerializeSeq for RootSerializer {
         T: serde::Serialize,
     {
         let node = value.serialize(NodeSerializer {
-            builder: &mut self.builder,
+            doc: &mut self.doc,
             tag_structs: self.tag_structs,
         })?;
-        self.builder.add_root_item(None, node);
+        self.doc.add_sequence_item(None, None, node);
         Ok(())
     }
 
@@ -252,7 +253,7 @@ impl serde::ser::SerializeMap for RootSerializer {
             "serialize_key() without matching serialize_value()"
         );
         self.pending_key = Some(key.serialize(NodeSerializer {
-            builder: &mut self.builder,
+            doc: &mut self.doc,
             tag_structs: self.tag_structs,
         })?);
         Ok(())
@@ -263,11 +264,11 @@ impl serde::ser::SerializeMap for RootSerializer {
         T: serde::Serialize,
     {
         let value_node = value.serialize(NodeSerializer {
-            builder: &mut self.builder,
+            doc: &mut self.doc,
             tag_structs: self.tag_structs,
         })?;
-        self.builder
-            .add_root_item(self.pending_key.take(), value_node);
+        self.doc
+            .add_sequence_item(None, self.pending_key.take(), value_node);
         Ok(())
     }
 
@@ -285,14 +286,14 @@ impl serde::ser::SerializeMap for RootSerializer {
         V: serde::Serialize,
     {
         let key_node = key.serialize(NodeSerializer {
-            builder: &mut self.builder,
+            doc: &mut self.doc,
             tag_structs: self.tag_structs,
         })?;
         let value_node = value.serialize(NodeSerializer {
-            builder: &mut self.builder,
+            doc: &mut self.doc,
             tag_structs: self.tag_structs,
         })?;
-        self.builder.add_root_item(Some(key_node), value_node);
+        self.doc.add_sequence_item(None, Some(key_node), value_node);
         Ok(())
     }
 }
@@ -309,12 +310,12 @@ impl serde::ser::SerializeStruct for RootSerializer {
     where
         T: serde::Serialize,
     {
-        let key_node = self.builder.add_scalar(OwnedScalar::plain(key))?;
+        let key_node = self.doc.add_scalar(Scalar::plain(key))?;
         let value_node = value.serialize(NodeSerializer {
-            builder: &mut self.builder,
+            doc: &mut self.doc,
             tag_structs: self.tag_structs,
         })?;
-        self.builder.add_root_item(Some(key_node), value_node);
+        self.doc.add_sequence_item(None, Some(key_node), value_node);
         Ok(())
     }
 
@@ -324,7 +325,7 @@ impl serde::ser::SerializeStruct for RootSerializer {
 }
 
 struct NodeSerializer<'a> {
-    builder: &'a mut Builder,
+    doc: &'a mut Document,
     tag_structs: bool,
 }
 impl<'a> serde::ser::Serializer for NodeSerializer<'a> {
@@ -339,81 +340,83 @@ impl<'a> serde::ser::Serializer for NodeSerializer<'a> {
     type SerializeStructVariant = SerializeSeq<'a>;
 
     fn serialize_bool(self, v: bool) -> Result<Self::Ok, Self::Error> {
-        self.builder
-            .add_scalar(OwnedScalar::plain(if v { "true" } else { "false" }))
+        self.doc
+            .add_scalar(Scalar::plain(if v { "true" } else { "false" }))
             .map_err(Into::into)
     }
 
     fn serialize_i8(self, v: i8) -> Result<Self::Ok, Self::Error> {
-        self.builder
-            .add_scalar(OwnedScalar::integer(v))
+        self.doc
+            .add_scalar(Scalar::plain(itoa::Buffer::new().format(v)))
             .map_err(Into::into)
     }
 
     fn serialize_i16(self, v: i16) -> Result<Self::Ok, Self::Error> {
-        self.builder
-            .add_scalar(OwnedScalar::integer(v))
+        self.doc
+            .add_scalar(Scalar::plain(itoa::Buffer::new().format(v)))
             .map_err(Into::into)
     }
 
     fn serialize_i32(self, v: i32) -> Result<Self::Ok, Self::Error> {
-        self.builder
-            .add_scalar(OwnedScalar::integer(v))
+        self.doc
+            .add_scalar(Scalar::plain(itoa::Buffer::new().format(v)))
             .map_err(Into::into)
     }
 
     fn serialize_i64(self, v: i64) -> Result<Self::Ok, Self::Error> {
-        self.builder
-            .add_scalar(OwnedScalar::integer(v))
+        self.doc
+            .add_scalar(Scalar::plain(itoa::Buffer::new().format(v)))
             .map_err(Into::into)
     }
 
     fn serialize_u8(self, v: u8) -> Result<Self::Ok, Self::Error> {
-        self.builder
-            .add_scalar(OwnedScalar::integer(v))
+        self.doc
+            .add_scalar(Scalar::plain(itoa::Buffer::new().format(v)))
             .map_err(Into::into)
     }
 
     fn serialize_u16(self, v: u16) -> Result<Self::Ok, Self::Error> {
-        self.builder
-            .add_scalar(OwnedScalar::integer(v))
+        self.doc
+            .add_scalar(Scalar::plain(itoa::Buffer::new().format(v)))
             .map_err(Into::into)
     }
 
     fn serialize_u32(self, v: u32) -> Result<Self::Ok, Self::Error> {
-        self.builder
-            .add_scalar(OwnedScalar::integer(v))
+        self.doc
+            .add_scalar(Scalar::plain(itoa::Buffer::new().format(v)))
             .map_err(Into::into)
     }
 
     fn serialize_u64(self, v: u64) -> Result<Self::Ok, Self::Error> {
-        self.builder
-            .add_scalar(OwnedScalar::integer(v))
+        self.doc
+            .add_scalar(Scalar::plain(itoa::Buffer::new().format(v)))
             .map_err(Into::into)
     }
 
     fn serialize_f32(self, v: f32) -> Result<Self::Ok, Self::Error> {
-        self.builder
-            .add_scalar(OwnedScalar::float(v))
+        self.doc
+            .add_scalar(Scalar::plain(ryu::Buffer::new().format(v)))
             .map_err(Into::into)
     }
 
     fn serialize_f64(self, v: f64) -> Result<Self::Ok, Self::Error> {
-        self.builder
-            .add_scalar(OwnedScalar::float(v))
+        self.doc
+            .add_scalar(Scalar::plain(ryu::Buffer::new().format(v)))
             .map_err(Into::into)
     }
 
     fn serialize_char(self, v: char) -> Result<Self::Ok, Self::Error> {
-        self.builder
-            .add_scalar(OwnedScalar::plain(v.to_string()))
+        let mut buf = [0; 4];
+        let s = v.encode_utf8(&mut buf);
+        self.doc
+            .add_scalar(Scalar::infer_style(s))
             .map_err(Into::into)
     }
 
     fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
         // Note: The emitter will determine the optimal representation for the string.
-        self.builder
-            .add_scalar(OwnedScalar::infer_style(v))
+        self.doc
+            .add_scalar(Scalar::infer_style(v))
             .map_err(Into::into)
     }
 
@@ -422,8 +425,8 @@ impl<'a> serde::ser::Serializer for NodeSerializer<'a> {
     }
 
     fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
-        self.builder
-            .add_scalar(OwnedScalar::plain("None"))
+        self.doc
+            .add_scalar(Scalar::plain("None"))
             .map_err(Into::into)
     }
 
@@ -435,17 +438,13 @@ impl<'a> serde::ser::Serializer for NodeSerializer<'a> {
     }
 
     fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
-        let id = self
-            .builder
-            .add_sequence(SequenceStyle::Tuple, None, None)?;
-        self.builder.complete_sequence(id);
+        let id = self.doc.add_sequence(SequenceStyle::Tuple, None, None)?;
+        self.doc.complete_sequence(id);
         Ok(id)
     }
 
     fn serialize_unit_struct(self, name: &'static str) -> Result<Self::Ok, Self::Error> {
-        self.builder
-            .add_scalar(OwnedScalar::plain(name))
-            .map_err(Into::into)
+        self.doc.add_scalar(Scalar::plain(name)).map_err(Into::into)
     }
 
     fn serialize_unit_variant(
@@ -454,8 +453,8 @@ impl<'a> serde::ser::Serializer for NodeSerializer<'a> {
         _variant_index: u32,
         variant: &'static str,
     ) -> Result<Self::Ok, Self::Error> {
-        self.builder
-            .add_scalar(OwnedScalar::plain(variant))
+        self.doc
+            .add_scalar(Scalar::plain(variant))
             .map_err(Into::into)
     }
 
@@ -468,16 +467,16 @@ impl<'a> serde::ser::Serializer for NodeSerializer<'a> {
         T: serde::Serialize,
     {
         // TODO: Should type tags be included here?
-        let type_tag = self.builder.add_scalar(OwnedScalar::plain(name))?;
+        let type_tag = self.doc.add_scalar(Scalar::plain(name))?;
         let seq = self
-            .builder
+            .doc
             .add_sequence(SequenceStyle::Tuple, None, Some(type_tag))?;
         let value = value.serialize(NodeSerializer {
-            builder: self.builder,
+            doc: self.doc,
             tag_structs: self.tag_structs,
         })?;
-        self.builder.add_sequence_item(seq, None, value);
-        self.builder.complete_sequence(seq);
+        self.doc.add_sequence_item(Some(seq), None, value);
+        self.doc.complete_sequence(seq);
         Ok(seq)
     }
 
@@ -495,22 +494,20 @@ impl<'a> serde::ser::Serializer for NodeSerializer<'a> {
     }
 
     fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
-        let seq = self.builder.add_sequence(SequenceStyle::List, None, None)?;
+        let seq = self.doc.add_sequence(SequenceStyle::List, None, None)?;
         Ok(SerializeSeq {
             node: seq,
-            builder: self.builder,
+            doc: self.doc,
             pending_key: None,
             tag_structs: self.tag_structs,
         })
     }
 
     fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple, Self::Error> {
-        let seq = self
-            .builder
-            .add_sequence(SequenceStyle::Tuple, None, None)?;
+        let seq = self.doc.add_sequence(SequenceStyle::Tuple, None, None)?;
         Ok(SerializeSeq {
             node: seq,
-            builder: self.builder,
+            doc: self.doc,
             pending_key: None,
             tag_structs: self.tag_structs,
         })
@@ -522,13 +519,13 @@ impl<'a> serde::ser::Serializer for NodeSerializer<'a> {
         _len: usize,
     ) -> Result<Self::SerializeTupleStruct, Self::Error> {
         // TODO: Should type tags be included?
-        let type_tag = self.builder.add_scalar(OwnedScalar::plain(name))?;
+        let type_tag = self.doc.add_scalar(Scalar::plain(name))?;
         let seq = self
-            .builder
+            .doc
             .add_sequence(SequenceStyle::Tuple, None, Some(type_tag))?;
         Ok(SerializeSeq {
             node: seq,
-            builder: self.builder,
+            doc: self.doc,
             pending_key: None,
             tag_structs: self.tag_structs,
         })
@@ -545,12 +542,10 @@ impl<'a> serde::ser::Serializer for NodeSerializer<'a> {
     }
 
     fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, Self::Error> {
-        let map = self
-            .builder
-            .add_sequence(SequenceStyle::Mapping, None, None)?;
+        let map = self.doc.add_sequence(SequenceStyle::Mapping, None, None)?;
         Ok(SerializeSeq {
             node: map,
-            builder: self.builder,
+            doc: self.doc,
             pending_key: None,
             tag_structs: self.tag_structs,
         })
@@ -562,17 +557,17 @@ impl<'a> serde::ser::Serializer for NodeSerializer<'a> {
         _len: usize,
     ) -> Result<Self::SerializeStruct, Self::Error> {
         let type_tag = if self.tag_structs {
-            Some(self.builder.add_scalar(OwnedScalar::plain(name))?)
+            Some(self.doc.add_scalar(Scalar::plain(name))?)
         } else {
             None
         };
 
         let map = self
-            .builder
+            .doc
             .add_sequence(SequenceStyle::Mapping, None, type_tag)?;
         Ok(SerializeSeq {
             node: map,
-            builder: self.builder,
+            doc: self.doc,
             pending_key: None,
             tag_structs: self.tag_structs,
         })
@@ -589,14 +584,14 @@ impl<'a> serde::ser::Serializer for NodeSerializer<'a> {
     }
 
     fn serialize_i128(self, v: i128) -> Result<Self::Ok, Self::Error> {
-        self.builder
-            .add_scalar(OwnedScalar::integer(v))
+        self.doc
+            .add_scalar(Scalar::plain(itoa::Buffer::new().format(v)))
             .map_err(Into::into)
     }
 
     fn serialize_u128(self, v: u128) -> Result<Self::Ok, Self::Error> {
-        self.builder
-            .add_scalar(OwnedScalar::integer(v))
+        self.doc
+            .add_scalar(Scalar::plain(itoa::Buffer::new().format(v)))
             .map_err(Into::into)
     }
 
@@ -614,7 +609,7 @@ impl<'a> serde::ser::Serializer for NodeSerializer<'a> {
 
 struct SerializeSeq<'a> {
     node: NodeId,
-    builder: &'a mut Builder,
+    doc: &'a mut Document,
     pending_key: Option<NodeId>,
     tag_structs: bool,
 }
@@ -628,15 +623,15 @@ impl<'a> serde::ser::SerializeSeq for SerializeSeq<'a> {
         T: serde::Serialize,
     {
         let element = value.serialize(NodeSerializer {
-            builder: self.builder,
+            doc: self.doc,
             tag_structs: self.tag_structs,
         })?;
-        self.builder.add_sequence_item(self.node, None, element);
+        self.doc.add_sequence_item(Some(self.node), None, element);
         Ok(())
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
-        self.builder.complete_sequence(self.node);
+        self.doc.complete_sequence(self.node);
         Ok(self.node)
     }
 }
@@ -654,7 +649,7 @@ impl<'a> serde::ser::SerializeMap for SerializeSeq<'a> {
             "serialize_key() without matching serialize_value()"
         );
         self.pending_key = Some(key.serialize(NodeSerializer {
-            builder: self.builder,
+            doc: self.doc,
             tag_structs: self.tag_structs,
         })?);
         Ok(())
@@ -665,16 +660,16 @@ impl<'a> serde::ser::SerializeMap for SerializeSeq<'a> {
         T: serde::Serialize,
     {
         let value_node = value.serialize(NodeSerializer {
-            builder: self.builder,
+            doc: self.doc,
             tag_structs: self.tag_structs,
         })?;
-        self.builder
-            .add_sequence_item(self.node, self.pending_key.take(), value_node);
+        self.doc
+            .add_sequence_item(Some(self.node), self.pending_key.take(), value_node);
         Ok(())
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
-        self.builder.complete_sequence(self.node);
+        self.doc.complete_sequence(self.node);
         Ok(self.node)
     }
 
@@ -692,15 +687,15 @@ impl<'a> serde::ser::SerializeMap for SerializeSeq<'a> {
             "mixed serialize_entry() with unpaired serialize_key()"
         );
         let key_node = key.serialize(NodeSerializer {
-            builder: self.builder,
+            doc: self.doc,
             tag_structs: self.tag_structs,
         })?;
         let value_node = value.serialize(NodeSerializer {
-            builder: self.builder,
+            doc: self.doc,
             tag_structs: self.tag_structs,
         })?;
-        self.builder
-            .add_sequence_item(self.node, Some(key_node), value_node);
+        self.doc
+            .add_sequence_item(Some(self.node), Some(key_node), value_node);
         Ok(())
     }
 }
@@ -717,7 +712,7 @@ impl<'a> serde::ser::SerializeTuple for SerializeSeq<'a> {
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
-        self.builder.complete_sequence(self.node);
+        self.doc.complete_sequence(self.node);
         Ok(self.node)
     }
 }
@@ -734,7 +729,7 @@ impl<'a> serde::ser::SerializeTupleStruct for SerializeSeq<'a> {
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
-        self.builder.complete_sequence(self.node);
+        self.doc.complete_sequence(self.node);
         Ok(self.node)
     }
 }
@@ -751,7 +746,7 @@ impl<'a> serde::ser::SerializeTupleVariant for SerializeSeq<'a> {
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
-        self.builder.complete_sequence(self.node);
+        self.doc.complete_sequence(self.node);
         Ok(self.node)
     }
 }
@@ -768,18 +763,18 @@ impl<'a> serde::ser::SerializeStruct for SerializeSeq<'a> {
     where
         T: serde::Serialize,
     {
-        let key_node = self.builder.add_scalar(OwnedScalar::plain(key))?;
+        let key_node = self.doc.add_scalar(Scalar::plain(key))?;
         let value_node = value.serialize(NodeSerializer {
-            builder: self.builder,
+            doc: self.doc,
             tag_structs: self.tag_structs,
         })?;
-        self.builder
-            .add_sequence_item(self.node, Some(key_node), value_node);
+        self.doc
+            .add_sequence_item(Some(self.node), Some(key_node), value_node);
         Ok(())
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
-        self.builder.complete_sequence(self.node);
+        self.doc.complete_sequence(self.node);
         Ok(self.node)
     }
 }
@@ -800,7 +795,7 @@ impl<'a> serde::ser::SerializeStructVariant for SerializeSeq<'a> {
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
-        self.builder.complete_sequence(self.node);
+        self.doc.complete_sequence(self.node);
         Ok(self.node)
     }
 }
