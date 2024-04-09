@@ -3,7 +3,7 @@ use std::io::BufRead;
 
 use crate::{
     error::Error, CharExt, Delimiter, Input, InputBuffer, NeedMore, Scalar, ScalarStyle,
-    SourceLocation, Spanned, SpannedExt, Token,
+    SourceLocation, Spanned, SpannedExt, StringExt as _, Token,
 };
 
 pub struct Scanner<R> {
@@ -17,6 +17,7 @@ pub struct Scanner<R> {
 struct ScannerInner {
     stack: Vec<State>,
     current_token: String,
+    trim_indent_buffer: String,
     root_has_items: bool,
 }
 
@@ -24,6 +25,8 @@ struct ScannerInner {
 pub enum ScannerError {
     #[error("unexpected char: {0:?}")]
     UnexpectedChar(char),
+    #[error("invalid escape sequence: {0:?}")]
+    InvalidEscapeSequence(char),
     #[error("unexpected EOF")]
     UnexpectedEof,
 }
@@ -69,8 +72,10 @@ enum StateType {
     Delimiter(DelimiterState),
     Sequence(SequenceState),
     PlainScalar,
-    QuotedScalar(TrimMode),
+    QuotedScalar,
     SingleQuotedScalar,
+    QuotedScalarTrimWhitespace,
+    QuotedScalarTrimIndent,
     Tag,
     Ref,
     Merge,
@@ -86,13 +91,6 @@ struct SequenceState {
 struct DelimiterState {
     newlines: usize,
     comma: bool,
-}
-
-#[derive(Clone, Copy)]
-enum TrimMode {
-    None,
-    Whitespace,
-    Indentation,
 }
 
 impl<R: BufRead> Scanner<R> {
@@ -190,8 +188,10 @@ impl ScannerInner {
             StateType::Delimiter(_) => self.scan_delimiter(input),
             StateType::Sequence(_) => self.scan_sequence(input),
             StateType::PlainScalar => self.scan_plain(input).map(Some),
-            StateType::QuotedScalar(_) => self.scan_quoted(input).map(Some),
-            StateType::SingleQuotedScalar => self.scan_quoted(input).map(Some),
+            StateType::QuotedScalar
+            | StateType::SingleQuotedScalar
+            | StateType::QuotedScalarTrimWhitespace
+            | StateType::QuotedScalarTrimIndent { .. } => self.scan_quoted(input).map(Some),
             StateType::Tag => self.scan_tag(input).map(Some),
             StateType::Ref => self.scan_ref(input).map(Some),
             StateType::Merge => self.scan_merge(input).map(Some),
@@ -208,7 +208,7 @@ impl ScannerInner {
             ..
         }) = self.stack.last_mut()
         else {
-            panic!("inconsistent scanner state");
+            panic!("inconsistent scanner state (rule: delimiter)");
         };
 
         loop {
@@ -257,7 +257,7 @@ impl ScannerInner {
             start,
         }) = self.stack.pop()
         else {
-            panic!("inconsistent scanner state");
+            panic!("inconsistent scanner state (rule: delimiter)");
         };
         let end = input.current_location();
 
@@ -283,7 +283,7 @@ impl ScannerInner {
                 ..
             }) => *has_items = true,
             None => self.root_has_items = true,
-            _ => panic!("inconsistent scanner state"),
+            _ => panic!("inconsistent scanner state (rule: sequence)"),
         }
     }
 
@@ -299,7 +299,7 @@ impl ScannerInner {
                 ..
             }) => !state.has_items,
             None => !self.root_has_items,
-            _ => panic!("inconsistent scanner state"),
+            _ => panic!("inconsistent scanner state (rule: sequence)"),
         };
 
         loop {
@@ -430,27 +430,25 @@ impl ScannerInner {
                 self.set_current_sequence_has_items();
                 self.stack.push(State {
                     start: input.current_location(),
-                    state: StateType::QuotedScalar(TrimMode::Whitespace),
+                    state: StateType::QuotedScalarTrimWhitespace,
                 });
-                _ = input.pop();
-                _ = input.pop();
+                _ = input.pop2();
                 self.scan_quoted(input)
             }
-            [Input::Value('>'), Input::Value('"')] => {
+            [Input::Value('|'), Input::Value('"')] => {
                 self.set_current_sequence_has_items();
                 self.stack.push(State {
                     start: input.current_location(),
-                    state: StateType::QuotedScalar(TrimMode::Indentation),
+                    state: StateType::QuotedScalarTrimIndent,
                 });
-                _ = input.pop();
-                _ = input.pop();
+                _ = input.pop2();
                 self.scan_quoted(input)
             }
             [Input::Value('"'), _] => {
                 self.set_current_sequence_has_items();
                 self.stack.push(State {
                     start: input.current_location(),
-                    state: StateType::QuotedScalar(TrimMode::None),
+                    state: StateType::QuotedScalar,
                 });
                 _ = input.pop();
                 self.scan_quoted(input)
@@ -545,7 +543,7 @@ impl ScannerInner {
             state: StateType::PlainScalar,
         }) = self.stack.pop()
         else {
-            panic!("inconsistent stack")
+            panic!("inconsistent stack (rule: plain scalar)")
         };
 
         Ok(
@@ -565,7 +563,7 @@ impl ScannerInner {
             state: StateType::Tag,
         }) = self.stack.pop()
         else {
-            panic!("inconsistent stack")
+            panic!("inconsistent stack (rule: tag)")
         };
 
         Ok(Token::Anchor(&self.current_token).in_span(start..input.current_location()))
@@ -582,7 +580,7 @@ impl ScannerInner {
             state: StateType::Ref,
         }) = self.stack.pop()
         else {
-            panic!("inconsistent stack")
+            panic!("inconsistent stack (rule: ref)")
         };
 
         Ok(Token::Ref(&self.current_token).in_span(start..input.current_location()))
@@ -599,7 +597,7 @@ impl ScannerInner {
             state: StateType::Merge,
         }) = self.stack.pop()
         else {
-            panic!("inconsistent stack")
+            panic!("inconsistent stack (rule: merge)")
         };
 
         Ok(Token::Merge(&self.current_token).in_span(start..input.current_location()))
@@ -621,37 +619,69 @@ impl ScannerInner {
         &'r mut self,
         input: &mut InputBuffer,
     ) -> Result<Spanned<Token<'r>>, Status> {
-        let (end_char, start, style) = match self.stack.last().expect("empty stack") {
-            State {
-                state: StateType::QuotedScalar(trim_mode),
-                start,
-            } => (
-                '"',
-                *start,
-                match trim_mode {
-                    TrimMode::None => ScalarStyle::Quoted,
-                    TrimMode::Whitespace => ScalarStyle::QuotedTrimWhitespace,
-                    TrimMode::Indentation => ScalarStyle::QuotedTrimIndent,
-                },
-            ),
-            State {
-                state: StateType::SingleQuotedScalar,
-                start,
-            } => ('\'', *start, ScalarStyle::SingleQuoted),
-            _ => panic!("inconsistent stack"),
+        let (state, start) = if let State {
+            state:
+                state @ (StateType::QuotedScalar
+                | StateType::QuotedScalarTrimWhitespace
+                | StateType::QuotedScalarTrimIndent
+                | StateType::SingleQuotedScalar),
+            start,
+        } = self.stack.last().expect("empty stack")
+        {
+            (*state, *start)
+        } else {
+            panic!("inconsistent stack (rule: quoted)")
+        };
+
+        let end_char = if let StateType::SingleQuotedScalar = state {
+            '\''
+        } else {
+            '"'
         };
 
         loop {
-            match input.peek()? {
-                Input::Value(ch) if ch == end_char => {
+            match input.peek2()? {
+                [Input::Value('\\'), Input::Value(ch)] => {
+                    let unescaped = match ch {
+                        '"' => '"',
+                        '\'' => '\'',
+                        '0' => '\0',
+                        'a' => '\x07',
+                        'b' => '\x08',
+                        't' => '\t',
+                        'n' => '\n',
+                        'v' => '\x0b',
+                        'f' => '\x0c',
+                        'r' => '\r',
+                        'u' => {
+                            todo!()
+                        }
+                        ch => return Err(ScannerError::InvalidEscapeSequence(ch).into()),
+                    };
+                    self.current_token.push(unescaped);
+                    _ = input.pop2();
+                }
+                [Input::Value('"'), _] if end_char == '"' => {
                     _ = input.pop();
                     break;
                 }
-                Input::Value(ch) => {
+                [Input::Value('\''), _] if end_char == '\'' => {
                     _ = input.pop();
-                    self.current_token.push(ch);
+                    break;
                 }
-                Input::Eof => {
+                [Input::Value(_), Input::Eof] => {
+                    return Err(ScannerError::UnexpectedEof.into());
+                }
+                // Ignore unescaped '\r'.
+                [Input::Value('\r'), _] => {
+                    _ = input.pop();
+                    continue;
+                }
+                [Input::Value(ch), Input::Value(_)] => {
+                    self.current_token.push(ch);
+                    _ = input.pop();
+                }
+                [Input::Eof, _] => {
                     return Err(ScannerError::UnexpectedEof.into());
                 }
             }
@@ -659,8 +689,28 @@ impl ScannerInner {
 
         self.stack.pop();
 
-        Ok(Token::Scalar(Scalar::new(&self.current_token, style))
-            .in_span(start..input.current_location()))
+        Ok(match state {
+            StateType::QuotedScalar => {
+                Token::Scalar(Scalar::new(&self.current_token, ScalarStyle::Quoted))
+            }
+            StateType::SingleQuotedScalar => {
+                Token::Scalar(Scalar::new(&self.current_token, ScalarStyle::SingleQuoted))
+            }
+            StateType::QuotedScalarTrimWhitespace => Token::Scalar(Scalar::new(
+                self.current_token.trim(),
+                ScalarStyle::QuotedTrimWhitespace,
+            )),
+            StateType::QuotedScalarTrimIndent => {
+                self.current_token
+                    .trim_indent_into(&mut self.trim_indent_buffer);
+                Token::Scalar(Scalar::new(
+                    &self.trim_indent_buffer,
+                    ScalarStyle::QuotedTrimIndent,
+                ))
+            }
+            _ => unreachable!(),
+        }
+        .in_span(start..input.current_location()))
     }
 
     fn scan_comment<'r>(
@@ -700,7 +750,7 @@ impl ScannerInner {
             state: StateType::Comment,
         }) = self.stack.pop()
         else {
-            panic!("inconsistent stack")
+            panic!("inconsistent stack (rule: comment)")
         };
 
         Ok(Token::Comment(&self.current_token).in_span(start..input.current_location()))

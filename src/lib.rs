@@ -16,6 +16,7 @@ mod builder;
 mod emitter;
 #[cfg(feature = "serde")]
 mod serialization;
+mod string;
 
 pub use builder::*;
 pub use char::*;
@@ -28,6 +29,7 @@ pub use location::*;
 pub use parser::*;
 pub use scalar::*;
 pub use scanner::*;
+pub use string::*;
 pub use token::*;
 pub use value::*;
 

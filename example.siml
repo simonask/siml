@@ -24,19 +24,15 @@ multiline_string: "
 Hello, World!
 "
 
-multiline_string_escape_newlines: "\
-Hello, World!\
-"
-
 multiline_string_with_whitspace_trimming: -"
-    "Hello, World!"
-"-
+    \"Hello, World!\"
+"
 
 # Indentation trimming: Leading newlines are trimmed, and each line has leading
 # spaces trimming equal to the indentation of the first line.
 multiline_string_with_indent_trimming: |"
     Hello, World!
-"|
+"
 
 # Multiline strings can be keys:
 |"
@@ -44,15 +40,15 @@ multiline_string_with_indent_trimming: |"
 ": 123.0
 
 # Any value may be preceded by an @anchor tag
-reusable_value @anchor {
+@anchor reusable_value {
     key: value
 }
 
 # A value may be referenced as-is by `&anchor`
-reused_value &anchor
+reused_value: &anchor
 
 # A tagged sequence can be merged into another sequence by `*anchor`
-merged_value {
+merged_value: {
     *anchor
     key2: value2
 }
