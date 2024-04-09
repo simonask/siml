@@ -109,6 +109,12 @@ impl InputBuffer {
     }
 
     #[inline]
+    pub fn pop2(&mut self) -> Result<(), NeedMore> {
+        self.pop()?;
+        self.pop().map(|_| ())
+    }
+
+    #[inline]
     pub fn current_location(&self) -> SourceLocation {
         self.current_location
     }
