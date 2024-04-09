@@ -162,6 +162,13 @@ impl ParserInner {
                     state.need_delimiter = false;
                     return Ok((None, Consume::Consume1));
                 }
+                Token::Comment(comment) => {
+                    state.need_delimiter = false;
+                    return Ok((
+                        Some(Event::Comment(comment.in_span(span))),
+                        Consume::Consume1,
+                    ));
+                }
                 Token::SequenceEndCurly => {}
                 _ => return Err(ParserError::UnexpectedToken(token.ty(), span.start)),
             }
@@ -170,6 +177,10 @@ impl ParserInner {
         if !state.parsing_kv_value {
             // Parse a key or a keyless value.
             Ok(match (token, next.map(|(t, _)| t)) {
+                (Token::Comment(comment), _) => (
+                    Some(Event::Comment(comment.in_span(span))),
+                    Consume::Consume1,
+                ),
                 // Skip newlines.
                 (Token::Delimiter(Delimiter::Newline), _) => (None, Consume::Consume1),
                 // Explicit empty key.
@@ -186,6 +197,7 @@ impl ParserInner {
                 (Token::KeySigil, Some(_)) if !state.next_is_key => {
                     state.next_is_key = true;
                     state.did_parse_colon = false;
+                    state.has_explicit_key_sigil = true;
                     (None, Consume::Consume1)
                 }
                 (Token::Scalar(scalar), Some(Token::Colon)) if !state.next_is_key => {
@@ -225,9 +237,17 @@ impl ParserInner {
         } else {
             // Parse the right-hand side of a key-value pair.
             Ok(match (token, next.map(|(t, _)| t)) {
+                (Token::Delimiter(Delimiter::Newline), _) if state.has_explicit_key_sigil => {
+                    (None, Consume::Consume1)
+                }
+                (Token::Comment(comment), _) => (
+                    Some(Event::Comment(comment.in_span(span))),
+                    Consume::Consume1,
+                ),
                 (Token::Colon, Some(Token::Delimiter(Delimiter::Newline)))
                     if !state.did_parse_colon =>
                 {
+                    state.has_explicit_key_sigil = false;
                     state.parsing_kv_value = false;
                     (
                         Some(Event::Empty(Span::empty(span.start))),
@@ -236,9 +256,11 @@ impl ParserInner {
                 }
                 (Token::Colon, Some(_)) if !state.did_parse_colon => {
                     state.did_parse_colon = true;
+                    state.has_explicit_key_sigil = false;
                     (None, Consume::Consume1)
                 }
                 _ if state.did_parse_colon => {
+                    state.has_explicit_key_sigil = false;
                     state.parsing_kv_value = false;
                     state.did_parse_colon = false;
                     state.need_delimiter = true;
@@ -269,6 +291,10 @@ impl ParserInner {
         };
 
         Ok(match (token, next.map(|(t, _)| t)) {
+            (Token::Comment(comment), _) => (
+                Some(Event::Comment(comment.in_span(span))),
+                Consume::Consume1,
+            ),
             (Token::Delimiter(Delimiter::Comma), _) => (None, Consume::Consume1),
             (
                 Token::Delimiter(Delimiter::Newline),
@@ -308,6 +334,10 @@ impl ParserInner {
         };
 
         Ok(match (token, next.map(|(t, _)| t)) {
+            (Token::Comment(comment), _) => (
+                Some(Event::Comment(comment.in_span(span))),
+                Consume::Consume1,
+            ),
             (Token::Delimiter(Delimiter::Comma), _) => (None, Consume::Consume1),
             (
                 Token::Delimiter(Delimiter::Newline),
@@ -393,6 +423,10 @@ impl ParserInner {
         stack: &mut Vec<ParserState>,
     ) -> Result<(Option<Event<'r>>, Consume), ParserError> {
         Ok(match (token, next) {
+            (Token::Comment(comment), _) => (
+                Some(Event::Comment(comment.in_span(span))),
+                Consume::Consume1,
+            ),
             // Bare sequences.
             (Token::SequenceStartCurly, _) => {
                 stack.push(ParserState::CurlySequence(CurlySequenceState {
@@ -492,6 +526,7 @@ struct CurlySequenceState {
     start: Span,
     parsing_kv_value: bool,
     next_is_key: bool,
+    has_explicit_key_sigil: bool,
     did_parse_colon: bool,
     need_delimiter: bool,
 }
@@ -748,5 +783,44 @@ mod tests {
                 Event::scalar(Scalar::plain("42").with_anchor("forty-two")),
             ],
         )
+    }
+
+    #[test]
+    fn comments() {
+        let input = r#"
+            # comment
+            foo: bar # comment
+            # comment
+        "#;
+
+        assert_events_eq(
+            input,
+            &[
+                Event::comment(" comment"),
+                Event::plain("foo"),
+                Event::plain("bar"),
+                Event::comment(" comment"),
+                Event::comment(" comment"),
+            ],
+        );
+
+        let input = r#"
+        foo: [1, 2,
+        #comment
+        3]
+        "#;
+
+        assert_events_eq(
+            input,
+            &[
+                Event::plain("foo"),
+                Event::begin_sequence(SequenceStyle::List, None, None),
+                Event::plain("1"),
+                Event::plain("2"),
+                Event::comment("comment"),
+                Event::plain("3"),
+                Event::end_sequence(),
+            ],
+        );
     }
 }
