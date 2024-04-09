@@ -284,6 +284,7 @@ dependencies = [
  "base64",
  "bitflags",
  "itoa",
+ "libc",
  "polonius-the-crab",
  "ryu",
  "serde",
