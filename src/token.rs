@@ -1,4 +1,4 @@
-use crate::{OwnedScalar, Scalar, ScalarStyle, Span, Spanned};
+use crate::{Scalar, ScalarStyle, Span, Spanned, SpannedExt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Token<'r> {
@@ -147,50 +147,8 @@ impl Delimiter {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum OwnedToken {
-    Scalar(OwnedScalar),
-    SequenceStartCurly,
-    SequenceEndCurly,
-    SequenceStartSquare,
-    SequenceEndSquare,
-    SequenceStartParens,
-    SequenceEndParens,
-    KeySigil,
-    Colon,
-    Delimiter(Delimiter),
-    Anchor(String),
-    Ref(String),
-    Merge(String),
-    Comment(String),
-}
-
-impl std::fmt::Display for OwnedToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.borrow(), f)
-    }
-}
-
 impl<'r> Token<'r> {
-    pub fn to_owned(self) -> OwnedToken {
-        match self {
-            Token::Scalar(s) => OwnedToken::Scalar(s.to_owned()),
-            Token::SequenceStartCurly => OwnedToken::SequenceStartCurly,
-            Token::SequenceEndCurly => OwnedToken::SequenceEndCurly,
-            Token::SequenceStartSquare => OwnedToken::SequenceStartSquare,
-            Token::SequenceEndSquare => OwnedToken::SequenceEndSquare,
-            Token::SequenceStartParens => OwnedToken::SequenceStartParens,
-            Token::SequenceEndParens => OwnedToken::SequenceEndParens,
-            Token::Delimiter(d) => OwnedToken::Delimiter(d),
-            Token::KeySigil => OwnedToken::KeySigil,
-            Token::Colon => OwnedToken::Colon,
-            Token::Anchor(anchor) => OwnedToken::Anchor(anchor.to_owned()),
-            Token::Ref(anchor) => OwnedToken::Ref(anchor.to_owned()),
-            Token::Merge(anchor) => OwnedToken::Merge(anchor.to_owned()),
-            Token::Comment(comment) => OwnedToken::Comment(comment.to_owned()),
-        }
-    }
-
+    #[inline]
     pub fn ty(&self) -> TokenType {
         match self {
             Token::Scalar(s) => TokenType::Scalar(s.style),
@@ -209,42 +167,31 @@ impl<'r> Token<'r> {
             Token::Comment(_) => TokenType::Comment,
         }
     }
-}
 
-impl OwnedToken {
-    pub fn borrow(&self) -> Token {
-        match self {
-            OwnedToken::Scalar(s) => Token::Scalar(s.borrow()),
-            OwnedToken::SequenceStartCurly => Token::SequenceStartCurly,
-            OwnedToken::SequenceEndCurly => Token::SequenceEndCurly,
-            OwnedToken::SequenceStartSquare => Token::SequenceStartSquare,
-            OwnedToken::SequenceEndSquare => Token::SequenceEndSquare,
-            OwnedToken::SequenceStartParens => Token::SequenceStartParens,
-            OwnedToken::SequenceEndParens => Token::SequenceEndParens,
-            OwnedToken::Colon => Token::Colon,
-            OwnedToken::KeySigil => Token::KeySigil,
-            OwnedToken::Delimiter(d) => Token::Delimiter(*d),
-            OwnedToken::Anchor(anchor) => Token::Anchor(anchor),
-            OwnedToken::Ref(anchor) => Token::Ref(anchor),
-            OwnedToken::Merge(anchor) => Token::Merge(anchor),
-            OwnedToken::Comment(comment) => Token::Comment(comment),
-        }
+    #[inline]
+    pub fn to_owned(self) -> CachedToken {
+        CachedToken::from(self)
     }
 }
 
-impl PartialEq<Token<'_>> for OwnedToken {
-    fn eq(&self, other: &Token) -> bool {
-        self.borrow() == *other
-    }
-}
-
-/// A cached token used by parser lookahead. This efficiently handles the
-/// strings of the cached token, such that allocations are amortized away.
+/// An owned token.
+///
+/// `CachedToken` holds an `Option<Spanned<Token>>`.
+///
+/// Replacing the token efficiently handles the strings of the cached token,
+/// such that allocations are amortized away.
 #[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct CachedToken {
+pub struct CachedToken {
     ty: Option<TokenType>,
     value: String,
     span: Span,
+}
+
+impl PartialEq<Token<'_>> for CachedToken {
+    #[inline]
+    fn eq(&self, other: &Token<'_>) -> bool {
+        self.get().is_some_and(|(token, _)| token == *other)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -265,7 +212,26 @@ pub enum TokenType {
     Comment,
 }
 
+impl From<Token<'_>> for CachedToken {
+    #[inline]
+    fn from(token: Token) -> Self {
+        let mut cached = CachedToken::default();
+        cached.set(Some(token.in_span(Span::default())));
+        cached
+    }
+}
+
 impl CachedToken {
+    #[inline]
+    pub fn is_some(&self) -> bool {
+        self.ty.is_some()
+    }
+
+    pub fn clear(&mut self) {
+        self.value.clear();
+        self.ty = None;
+    }
+
     pub fn set(&mut self, token: Option<Spanned<Token>>) {
         self.value.clear();
 

@@ -1,8 +1,8 @@
 use std::io::BufRead;
 
 use crate::{
-    CachedToken, Delimiter, Error, Event, Scanner, SequenceStyle, SourceLocation, Span, Spanned,
-    SpannedExt, Token, TokenType,
+    CachedEvent, CachedToken, Delimiter, Error, Event, Scanner, SequenceStyle, SourceLocation,
+    Span, Spanned, SpannedExt, Token, TokenType,
 };
 
 /// Streaming parser that turns [`Token`]s into [`Event`]s.
@@ -68,7 +68,7 @@ impl<R: BufRead> ParseStream<R> {
         }
     }
 
-    pub fn next_event(&mut self) -> Result<Option<Event>, Error> {
+    pub fn next_event(&mut self, out: &mut CachedEvent) -> Result<(), Error> {
         let Self {
             scanner,
             inner,
@@ -76,69 +76,67 @@ impl<R: BufRead> ParseStream<R> {
             eof,
         } = self;
 
+        out.clear();
+
         if *eof {
-            return Ok(None);
+            return Ok(());
         }
 
         loop {
             match pending_consume {
                 Consume::Consume0 => {}
                 Consume::Consume1 => {
-                    let token = scanner.next_token()?;
-                    inner.lookahead.set_next(token);
+                    scanner.next_token(inner.lookahead.write_next())?;
                 }
                 Consume::Consume2 => {
-                    let token = scanner.next_token()?;
-                    inner.lookahead.set_next(token);
-                    let token = scanner.next_token()?;
-                    inner.lookahead.set_next(token);
+                    scanner.next_token(inner.lookahead.write_next())?;
+                    scanner.next_token(inner.lookahead.write_next())?;
                 }
                 Consume::Eof => unreachable!("unexpected EOF"),
             }
 
-            match inner.parse_next()? {
-                (Some(event), consume) => {
-                    *pending_consume = consume;
-                    return Ok(Some(unsafe {
-                        // SAFETY: Upcasting lifetime (valid under Polonius).
-                        std::mem::transmute::<Event<'_>, Event<'_>>(event)
-                    }));
+            match inner.parse_next(out)? {
+                Consume::Eof => {
+                    *eof = !out.is_some();
+                    return Ok(());
                 }
-                (None, Consume::Eof) => {
-                    *eof = true;
-                    return Ok(None);
-                }
-                (None, consume) => {
-                    // Did not produce an event, just consume tokens and continue.
+                consume => {
                     *pending_consume = consume;
-                    continue;
+                    if out.is_some() {
+                        return Ok(());
+                    } else {
+                        // Did not produce an event, just consume tokens and continue.
+                        continue;
+                    }
                 }
             }
         }
     }
 
-    pub fn expect_event(&mut self) -> Result<Event, Error> {
-        self.next_event().and_then(|event| {
-            event.ok_or_else(|| Error::Scanner(crate::ScannerError::UnexpectedEof))
-        })
+    pub fn expect_event(&mut self, out: &mut CachedEvent) -> Result<(), Error> {
+        self.next_event(out)?;
+        if !out.is_some() {
+            return Err(Error::Scanner(crate::ScannerError::UnexpectedEof));
+        }
+        Ok(())
     }
 }
 
 impl ParserInner {
-    fn parse_next(&mut self) -> Result<(Option<Event>, Consume), ParserError> {
+    fn parse_next(&mut self, out: &mut CachedEvent) -> Result<Consume, ParserError> {
         if let Some(state) = self.stack.last() {
             match state {
-                ParserState::CurlySequence(_) => self.parse_curly_sequence_item(),
-                ParserState::SquareSequence(_) => self.parse_square_sequence_item(),
-                ParserState::ParensSequence(_) => self.parse_parens_sequence_item(),
-                ParserState::TaggedValue(_) => self.parse_value_after_tag_anchor(),
+                ParserState::CurlySequence(_) => self.parse_curly_sequence_item(out),
+                ParserState::SquareSequence(_) => self.parse_square_sequence_item(out),
+                ParserState::ParensSequence(_) => self.parse_parens_sequence_item(out),
+                ParserState::TaggedValue(_) => self.parse_value_after_tag_anchor(out),
             }
         } else {
-            self.parse_curly_sequence_item()
+            self.parse_curly_sequence_item(out)
         }
     }
 
-    fn parse_curly_sequence_item(&mut self) -> Result<(Option<Event>, Consume), ParserError> {
+    fn parse_curly_sequence_item(&mut self, out: &mut CachedEvent) -> Result<Consume, ParserError> {
         let (state, is_root) = match self.stack.last_mut() {
             Some(ParserState::CurlySequence(state)) => (state, false),
             None => (&mut self.root, true),
@@ -147,7 +145,7 @@ impl ParserInner {
 
         let [Some((token, span)), next] = self.lookahead.peek2() else {
             if is_root {
-                return Ok((None, Consume::Eof));
+                return Ok(Consume::Eof);
             } else {
                 return Err(ParserError::UnclosedDelimiter(
                     TokenType::SequenceStartCurly,
@@ -160,14 +158,12 @@ impl ParserInner {
             match token {
                 Token::Delimiter(..) => {
                     state.need_delimiter = false;
-                    return Ok((None, Consume::Consume1));
+                    return Ok(Consume::Consume1);
                 }
                 Token::Comment(comment) => {
                     state.need_delimiter = false;
-                    return Ok((
-                        Some(Event::Comment(comment.in_span(span))),
-                        Consume::Consume1,
-                    ));
+                    out.set(Some(Event::Comment(comment.in_span(span))));
+                    return Ok(Consume::Consume1);
                 }
                 Token::SequenceEndCurly => {}
                 _ => return Err(ParserError::UnexpectedToken(token.ty(), span.start)),
@@ -177,41 +173,42 @@ impl ParserInner {
         if !state.parsing_kv_value {
             // Parse a key or a keyless value.
             Ok(match (token, next.map(|(t, _)| t)) {
-                (Token::Comment(comment), _) => (
-                    Some(Event::Comment(comment.in_span(span))),
-                    Consume::Consume1,
-                ),
+                (Token::Comment(comment), _) => {
+                    out.set(Some(Event::Comment(comment.in_span(span))));
+                    Consume::Consume1
+                }
                 // Skip newlines.
-                (Token::Delimiter(Delimiter::Newline), _) => (None, Consume::Consume1),
+                (Token::Delimiter(Delimiter::Newline), _) => Consume::Consume1,
                 // Explicit empty key.
                 (Token::KeySigil, Some(Token::Colon)) if !state.next_is_key => {
                     state.parsing_kv_value = true;
                     state.did_parse_colon = true;
                     state.next_is_key = false;
                     let colon_span = next.map(|(_, span)| span).unwrap();
-                    (
-                        Some(Event::Empty(span.merge(&colon_span))),
-                        Consume::Consume2,
-                    )
+                    out.set(Some(Event::Empty(span.merge(&colon_span))));
+                    Consume::Consume2
                 }
                 (Token::KeySigil, Some(_)) if !state.next_is_key => {
                     state.next_is_key = true;
                     state.did_parse_colon = false;
                     state.has_explicit_key_sigil = true;
-                    (None, Consume::Consume1)
+                    Consume::Consume1
                 }
                 (Token::Scalar(scalar), Some(Token::Colon)) if !state.next_is_key => {
                     state.parsing_kv_value = true;
                     state.did_parse_colon = true;
                     state.next_is_key = false;
-                    (Some(Event::Scalar(scalar.in_span(span))), Consume::Consume2)
+                    out.set(Some(Event::Scalar(scalar.in_span(span))));
+                    Consume::Consume2
                 }
                 (Token::SequenceEndCurly, _) => {
                     self.stack.pop();
-                    (Some(Event::EndMapping(span)), Consume::Consume1)
+                    out.set(Some(Event::EndMapping(span)));
+                    Consume::Consume1
                 }
                 (Token::Merge(anchor), _) => {
-                    (Some(Event::Merge(anchor.in_span(span))), Consume::Consume1)
+                    out.set(Some(Event::Merge(anchor.in_span(span))));
+                    Consume::Consume1
                 }
                 _ => {
                     state.parsing_kv_value = true;
@@ -220,6 +217,7 @@ impl ParserInner {
                         state.next_is_key = false;
                         return Self::do_parse_value(
                             ((token, span), next),
+                            out,
                             &mut self.pending_anchor,
                             &mut self.stack,
                         );
@@ -227,10 +225,8 @@ impl ParserInner {
                         // Emit artificial empty key, and pretend we parsed a
                         // colon, since the next value is keyless.
                         state.did_parse_colon = true;
-                        (
-                            Some(Event::Empty(Span::empty(span.start))),
-                            Consume::Consume0,
-                        )
+                        out.set(Some(Event::Empty(Span::empty(span.start))));
+                        Consume::Consume0
                     }
                 }
             })
@@ -238,26 +234,24 @@ impl ParserInner {
             // Parse the right-hand side of a key-value pair.
             Ok(match (token, next.map(|(t, _)| t)) {
                 (Token::Delimiter(Delimiter::Newline), _) if state.has_explicit_key_sigil => {
-                    (None, Consume::Consume1)
+                    Consume::Consume1
                 }
-                (Token::Comment(comment), _) => (
-                    Some(Event::Comment(comment.in_span(span))),
-                    Consume::Consume1,
-                ),
+                (Token::Comment(comment), _) => {
+                    out.set(Some(Event::Comment(comment.in_span(span))));
+                    Consume::Consume1
+                }
                 (Token::Colon, Some(Token::Delimiter(Delimiter::Newline)))
                     if !state.did_parse_colon =>
                 {
                     state.has_explicit_key_sigil = false;
                     state.parsing_kv_value = false;
-                    (
-                        Some(Event::Empty(Span::empty(span.start))),
-                        Consume::Consume2,
-                    )
+                    out.set(Some(Event::Empty(Span::empty(span.start))));
+                    Consume::Consume2
                 }
                 (Token::Colon, Some(_)) if !state.did_parse_colon => {
                     state.did_parse_colon = true;
                     state.has_explicit_key_sigil = false;
-                    (None, Consume::Consume1)
+                    Consume::Consume1
                 }
                 _ if state.did_parse_colon => {
                     state.has_explicit_key_sigil = false;
@@ -266,6 +260,7 @@ impl ParserInner {
                     state.need_delimiter = true;
                     return Self::do_parse_value(
                         ((token, span), next),
+                        out,
                         &mut self.pending_anchor,
                         &mut self.stack,
                     );
@@ -277,7 +272,10 @@ impl ParserInner {
         }
     }
 
-    fn parse_square_sequence_item(&mut self) -> Result<(Option<Event>, Consume), ParserError> {
+    fn parse_square_sequence_item(
+        &mut self,
+        out: &mut CachedEvent,
+    ) -> Result<Consume, ParserError> {
         let state = match self.stack.last_mut() {
             Some(ParserState::SquareSequence(state)) => state,
             _ => panic!("inconsistent parser state"),
@@ -291,28 +289,31 @@ impl ParserInner {
         };
 
         Ok(match (token, next.map(|(t, _)| t)) {
-            (Token::Comment(comment), _) => (
-                Some(Event::Comment(comment.in_span(span))),
-                Consume::Consume1,
-            ),
-            (Token::Delimiter(Delimiter::Comma), _) => (None, Consume::Consume1),
+            (Token::Comment(comment), _) => {
+                out.set(Some(Event::Comment(comment.in_span(span))));
+                Consume::Consume1
+            }
+            (Token::Delimiter(Delimiter::Comma), _) => Consume::Consume1,
             (
                 Token::Delimiter(Delimiter::Newline),
                 Some(Token::SequenceEndSquare | Token::Comment(..)),
-            ) => (None, Consume::Consume1),
+            ) => Consume::Consume1,
             (Token::Delimiter(Delimiter::Newline), _) => {
                 return Err(ParserError::MissingCommaInList(span.start))
             }
             (Token::SequenceEndSquare, _) => {
                 self.stack.pop();
-                Event::EndSequence(span).consume1()
+                out.set(Some(Event::EndSequence(span)));
+                Consume::Consume1
             }
             (Token::Merge(anchor), _) => {
-                (Some(Event::Merge(anchor.in_span(span))), Consume::Consume1)
+                out.set(Some(Event::Merge(anchor.in_span(span))));
+                Consume::Consume1
             }
             _ => {
                 return Self::do_parse_value(
                     ((token, span), next),
+                    out,
                     &mut self.pending_anchor,
                     &mut self.stack,
                 )
@@ -320,7 +321,10 @@ impl ParserInner {
         })
     }
 
-    fn parse_parens_sequence_item(&mut self) -> Result<(Option<Event>, Consume), ParserError> {
+    fn parse_parens_sequence_item(
+        &mut self,
+        out: &mut CachedEvent,
+    ) -> Result<Consume, ParserError> {
         let state = match self.stack.last_mut() {
             Some(ParserState::ParensSequence(state)) => state,
             _ => panic!("inconsistent parser state"),
@@ -334,28 +338,31 @@ impl ParserInner {
         };
 
         Ok(match (token, next.map(|(t, _)| t)) {
-            (Token::Comment(comment), _) => (
-                Some(Event::Comment(comment.in_span(span))),
-                Consume::Consume1,
-            ),
-            (Token::Delimiter(Delimiter::Comma), _) => (None, Consume::Consume1),
+            (Token::Comment(comment), _) => {
+                out.set(Some(Event::Comment(comment.in_span(span))));
+                Consume::Consume1
+            }
+            (Token::Delimiter(Delimiter::Comma), _) => Consume::Consume1,
             (
                 Token::Delimiter(Delimiter::Newline),
                 Some(Token::SequenceEndParens | Token::Comment(..)),
-            ) => (None, Consume::Consume1),
+            ) => Consume::Consume1,
             (Token::Delimiter(Delimiter::Newline), _) => {
                 return Err(ParserError::MissingCommaInList(span.start))
             }
             (Token::SequenceEndParens, _) => {
                 self.stack.pop();
-                Event::EndSequence(span).consume1()
+                out.set(Some(Event::EndSequence(span)));
+                Consume::Consume1
             }
             (Token::Merge(anchor), _) => {
-                (Some(Event::Merge(anchor.in_span(span))), Consume::Consume1)
+                out.set(Some(Event::Merge(anchor.in_span(span))));
+                Consume::Consume1
             }
             _ => {
                 return Self::do_parse_value(
                     ((token, span), next),
+                    out,
                     &mut self.pending_anchor,
                     &mut self.stack,
                 )
@@ -365,9 +372,10 @@ impl ParserInner {
 
     fn do_parse_value<'r>(
         ((token, span), next): ((Token<'r>, Span), Option<(Token<'r>, Span)>),
+        out: &mut CachedEvent,
         pending_anchor: &'r mut PendingAnchor,
         stack: &mut Vec<ParserState>,
-    ) -> Result<(Option<Event<'r>>, Consume), ParserError> {
+    ) -> Result<Consume, ParserError> {
         match (token, next.map(|(t, _)| t)) {
             (Token::Anchor(_), None) => return Err(ParserError::TrailingAnchor(span.start)),
             (
@@ -385,31 +393,35 @@ impl ParserInner {
                 }
                 stack.push(ParserState::TaggedValue(TaggedValueState {}));
                 pending_anchor.set(tag, span);
-                return Ok((None, Consume::Consume1));
+                return Ok(Consume::Consume1);
             }
 
             _ => (),
         }
 
-        Self::do_parse_untagged_value(((token, span), next), pending_anchor, stack)
+        Self::do_parse_untagged_value(((token, span), next), out, pending_anchor, stack)
     }
 
-    fn parse_value_after_tag_anchor(&mut self) -> Result<(Option<Event>, Consume), ParserError> {
+    fn parse_value_after_tag_anchor(
+        &mut self,
+        out: &mut CachedEvent,
+    ) -> Result<Consume, ParserError> {
         match self.stack.pop() {
             Some(ParserState::TaggedValue(_)) => (),
             _ => panic!("inconsistent parser state"),
         };
 
-        self.parse_untagged_value()
+        self.parse_untagged_value(out)
     }
 
-    fn parse_untagged_value(&mut self) -> Result<(Option<Event>, Consume), ParserError> {
+    fn parse_untagged_value(&mut self, out: &mut CachedEvent) -> Result<Consume, ParserError> {
         let [Some((token, span)), next] = self.lookahead.peek2() else {
             unreachable!("eof not handled in parent parser");
         };
 
         Self::do_parse_untagged_value(
             ((token, span), next),
+            out,
             &mut self.pending_anchor,
             &mut self.stack,
         )
@@ -417,54 +429,55 @@ impl ParserInner {
 
     // Implementation of `parse_untagged_value`. This is just here to work
     // around the borrow checker. Will be fixed with polonius.
-    fn do_parse_untagged_value<'r>(
-        ((token, span), next): ((Token<'r>, Span), Option<(Token<'r>, Span)>),
-        pending_anchor: &'r mut PendingAnchor,
+    fn do_parse_untagged_value(
+        ((token, span), next): ((Token, Span), Option<(Token, Span)>),
+        out: &mut CachedEvent,
+        pending_anchor: &mut PendingAnchor,
         stack: &mut Vec<ParserState>,
-    ) -> Result<(Option<Event<'r>>, Consume), ParserError> {
+    ) -> Result<Consume, ParserError> {
         Ok(match (token, next) {
-            (Token::Comment(comment), _) => (
-                Some(Event::Comment(comment.in_span(span))),
-                Consume::Consume1,
-            ),
+            (Token::Comment(comment), _) => {
+                out.set(Some(Event::Comment(comment.in_span(span))));
+                Consume::Consume1
+            }
             // Bare sequences.
             (Token::SequenceStartCurly, _) => {
                 stack.push(ParserState::CurlySequence(CurlySequenceState {
                     start: span,
                     ..Default::default()
                 }));
-                Event::BeginMapping {
+                out.set(Some(Event::BeginMapping {
                     span,
                     type_tag: None,
                     anchor: pending_anchor.take(),
-                }
-                .consume1()
+                }));
+                Consume::Consume1
             }
             (Token::SequenceStartSquare, _) => {
                 stack.push(ParserState::SquareSequence(SquareSequenceState {
                     start: span,
                     ..Default::default()
                 }));
-                Event::BeginSequence {
+                out.set(Some(Event::BeginSequence {
                     span,
                     style: SequenceStyle::List,
                     type_tag: None,
                     anchor: pending_anchor.take(),
-                }
-                .consume1()
+                }));
+                Consume::Consume1
             }
             (Token::SequenceStartParens, _) => {
                 stack.push(ParserState::ParensSequence(ParensSequenceState {
                     start: span,
                     ..Default::default()
                 }));
-                Event::BeginSequence {
+                out.set(Some(Event::BeginSequence {
                     span,
                     style: SequenceStyle::Tuple,
                     type_tag: None,
                     anchor: pending_anchor.take(),
-                }
-                .consume1()
+                }));
+                Consume::Consume1
             }
             // Type-tagged sequences.
             (Token::Scalar(scalar), Some((Token::SequenceStartCurly, start_span))) => {
@@ -472,48 +485,53 @@ impl ParserInner {
                     start: start_span,
                     ..Default::default()
                 }));
-                Event::BeginMapping {
+                out.set(Some(Event::BeginMapping {
                     span: start_span,
                     type_tag: Some(scalar.in_span(span)),
                     anchor: pending_anchor.take(),
-                }
-                .consume2()
+                }));
+                Consume::Consume2
             }
             (Token::Scalar(scalar), Some((Token::SequenceStartSquare, start_span))) => {
                 stack.push(ParserState::SquareSequence(SquareSequenceState {
                     start: start_span,
                     ..Default::default()
                 }));
-                Event::BeginSequence {
+                out.set(Some(Event::BeginSequence {
                     span: start_span,
                     style: SequenceStyle::List,
                     type_tag: Some(scalar.in_span(span)),
                     anchor: pending_anchor.take(),
-                }
-                .consume2()
+                }));
+                Consume::Consume2
             }
             (Token::Scalar(scalar), Some((Token::SequenceStartParens, start_span))) => {
                 stack.push(ParserState::ParensSequence(ParensSequenceState {
                     start: start_span,
                     ..Default::default()
                 }));
-                Event::BeginSequence {
+                out.set(Some(Event::BeginSequence {
                     span: start_span,
                     style: SequenceStyle::Tuple,
                     type_tag: Some(scalar.in_span(span)),
                     anchor: pending_anchor.take(),
-                }
-                .consume2()
+                }));
+                Consume::Consume2
             }
             // Bare scalars.
-            (Token::Scalar(scalar), _) => Event::Scalar(
-                scalar
-                    .with_anchor(pending_anchor.take().map(Spanned::into_inner))
-                    .in_span(span),
-            )
-            .consume1(),
+            (Token::Scalar(scalar), _) => {
+                out.set(Some(Event::Scalar(
+                    scalar
+                        .with_anchor(pending_anchor.take().map(Spanned::into_inner))
+                        .in_span(span),
+                )));
+                Consume::Consume1
+            }
             // References
-            (Token::Ref(anchor), _) => Event::Ref(anchor.in_span(span)).consume1(),
+            (Token::Ref(anchor), _) => {
+                out.set(Some(Event::Ref(anchor.in_span(span))));
+                Consume::Consume1
+            }
             (unexpected, _) => {
                 return Err(ParserError::UnexpectedToken(unexpected.ty(), span.start))
             }
@@ -547,7 +565,6 @@ struct TaggedValueState {}
 #[derive(Default)]
 struct Lookahead {
     cached: [CachedToken; 2],
-    eof: bool,
 }
 
 impl Lookahead {
@@ -555,14 +572,9 @@ impl Lookahead {
         [self.cached[0].get(), self.cached[1].get()]
     }
 
-    pub fn set_next(&mut self, token: Option<Spanned<Token>>) {
-        if token.is_none() {
-            self.eof = true;
-        } else {
-            assert!(!self.eof, "set_next(Some(...)) after eof");
-        }
+    pub fn write_next(&mut self) -> &mut CachedToken {
         self.cached.swap(0, 1);
-        self.cached[1].set(token);
+        &mut self.cached[1]
     }
 }
 
@@ -619,10 +631,16 @@ mod tests {
     fn assert_events_eq(input: &str, expected: &[Event]) {
         let mut parser = ParseStream::new(input.as_bytes());
         let mut events = vec![];
+        let mut event = CachedEvent::default();
         loop {
-            match parser.next_event() {
-                Ok(Some(event)) => events.push(event.to_owned()),
-                Ok(None) => break,
+            match parser.next_event(&mut event) {
+                Ok(()) => {
+                    if event.is_some() {
+                        events.push(std::mem::take(&mut event))
+                    } else {
+                        break;
+                    }
+                }
                 Err(e) => panic!("error: {}", e),
             }
         }
@@ -633,10 +651,16 @@ mod tests {
     fn assert_events_err(input: &str, expected: ParserError) {
         let mut parser = ParseStream::new(input.as_bytes());
         let mut events = vec![];
+        let mut event = CachedEvent::default();
         loop {
-            match parser.next_event() {
-                Ok(Some(event)) => events.push(event.to_owned()),
-                Ok(None) => break,
+            match parser.next_event(&mut event) {
+                Ok(_) => {
+                    if event.is_some() {
+                        events.push(std::mem::take(&mut event))
+                    } else {
+                        break;
+                    }
+                }
                 Err(e) => {
                     assert_eq!(e, expected);
                     return;

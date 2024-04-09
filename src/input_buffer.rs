@@ -18,21 +18,10 @@ pub enum Input<T> {
     Eof,
 }
 
-impl<T> Input<T> {
-    #[inline]
-    pub fn is_eof(&self) -> bool {
-        matches!(self, Input::Eof)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NeedMore(pub usize);
 
 impl InputBuffer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn len(&self) -> usize {
         self.buffer.len()
     }

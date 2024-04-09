@@ -1,4 +1,4 @@
-use clap::{parser, Parser};
+use clap::Parser;
 use siml::{Document, Emitter};
 
 #[derive(clap::Parser, Debug)]

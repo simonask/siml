@@ -1,9 +1,8 @@
-use polonius_the_crab::*;
 use std::io::BufRead;
 
 use crate::{
-    error::Error, CharExt, Delimiter, Input, InputBuffer, NeedMore, Scalar, ScalarStyle,
-    SourceLocation, Spanned, SpannedExt, StringExt as _, Token,
+    error::Error, CachedToken, CharExt, Delimiter, Input, InputBuffer, NeedMore, Scalar,
+    ScalarStyle, SourceLocation, SpannedExt, StringExt as _, Token,
 };
 
 pub struct Scanner<R> {
@@ -103,32 +102,32 @@ impl<R: BufRead> Scanner<R> {
         }
     }
 
-    pub fn next_token(&mut self) -> Result<Option<Spanned<Token>>, Error> {
+    /// Read the next token from the reader into `out`.
+    ///
+    /// When `out.is_some()` is `true`, and no error occurred, a token was
+    /// successfully read. When `out.is_some()` is `false`, and no error
+    /// occurred, the EOF was reached.
+    pub fn next_token(&mut self, out: &mut CachedToken) -> Result<(), Error> {
         let Self {
             reader,
             buffer,
             inner,
             eof,
         } = self;
-        let mut inner = &mut *inner;
 
-        // Need polonius here to extend the lifetime of the `Token`, which
-        // contains a reference into `inner`, but current borrowck gets confused due to the loop.
-        polonius_loop!(
-            |inner| -> Result<Option<Spanned<Token<'polonius>>>, Error> {
-                match inner.next_token(buffer) {
-                    Ok(Some(token)) => polonius_return!(Ok(Some(token))),
-                    Ok(None) => polonius_return!(Ok(None)),
-                    Err(Status::NeedMore(NeedMore(at_least))) => {
-                        match Self::read_chars(reader, buffer, at_least, eof) {
-                            Ok(()) => polonius_continue!(),
-                            Err(e) => polonius_return!(Err(e)),
-                        }
+        loop {
+            out.clear();
+            match inner.next_token(buffer, out) {
+                Ok(()) => return Ok(()),
+                Err(Status::NeedMore(NeedMore(at_least))) => {
+                    match Self::read_chars(reader, buffer, at_least, eof) {
+                        Ok(()) => continue,
+                        Err(e) => return Err(e),
                     }
-                    Err(Status::Error(e)) => polonius_return!(Err(e)),
                 }
+                Err(Status::Error(e)) => return Err(e),
             }
-        )
+        }
     }
 
     fn read_chars(
@@ -176,33 +175,31 @@ impl<R: BufRead> Scanner<R> {
 }
 
 impl ScannerInner {
-    fn next_token<'r>(
-        &'r mut self,
-        input: &mut InputBuffer,
-    ) -> Result<Option<Spanned<Token<'r>>>, Status> {
+    fn next_token(&mut self, input: &mut InputBuffer, out: &mut CachedToken) -> Result<(), Status> {
         let Some(state) = self.stack.last() else {
-            return self.scan_sequence(input);
+            return self.scan_sequence(input, out);
         };
 
         match state.state {
-            StateType::Delimiter(_) => self.scan_delimiter(input),
-            StateType::Sequence(_) => self.scan_sequence(input),
-            StateType::PlainScalar => self.scan_plain(input).map(Some),
+            StateType::Delimiter(_) => self.scan_delimiter(input, out),
+            StateType::Sequence(_) => self.scan_sequence(input, out),
+            StateType::PlainScalar => self.scan_plain(input, out),
             StateType::QuotedScalar
             | StateType::SingleQuotedScalar
             | StateType::QuotedScalarTrimWhitespace
-            | StateType::QuotedScalarTrimIndent { .. } => self.scan_quoted(input).map(Some),
-            StateType::Tag => self.scan_tag(input).map(Some),
-            StateType::Ref => self.scan_ref(input).map(Some),
-            StateType::Merge => self.scan_merge(input).map(Some),
-            StateType::Comment => self.scan_comment(input).map(Some),
+            | StateType::QuotedScalarTrimIndent { .. } => self.scan_quoted(input, out),
+            StateType::Tag => self.scan_tag(input, out),
+            StateType::Ref => self.scan_ref(input, out),
+            StateType::Merge => self.scan_merge(input, out),
+            StateType::Comment => self.scan_comment(input, out),
         }
     }
 
-    fn scan_delimiter<'r>(
-        &'r mut self,
+    fn scan_delimiter(
+        &mut self,
         input: &mut InputBuffer,
-    ) -> Result<Option<Spanned<Token<'r>>>, Status> {
+        out: &mut CachedToken,
+    ) -> Result<(), Status> {
         let Some(State {
             state: StateType::Delimiter(state),
             ..
@@ -246,7 +243,7 @@ impl ScannerInner {
                         state: StateType::Comment,
                     });
                     self.current_token.clear();
-                    return self.scan_comment(input).map(Some);
+                    return self.scan_comment(input, out);
                 }
                 _ => break,
             }
@@ -262,15 +259,17 @@ impl ScannerInner {
         let end = input.current_location();
 
         if state.comma {
-            return Ok(Some(Token::Delimiter(Delimiter::Comma).in_span(start..end)));
+            out.set(Some(Token::Delimiter(Delimiter::Comma).in_span(start..end)));
+            return Ok(());
         }
         if state.newlines > 0 {
-            return Ok(Some(
+            out.set(Some(
                 Token::Delimiter(Delimiter::Newline).in_span(start..end),
             ));
+            return Ok(());
         }
         if input.is_eof() {
-            return Ok(None);
+            return Ok(());
         }
 
         panic!("inconsistent scanner state; scan_delimiter()")
@@ -287,10 +286,11 @@ impl ScannerInner {
         }
     }
 
-    fn scan_sequence<'r>(
-        &'r mut self,
+    fn scan_sequence(
+        &mut self,
         input: &mut InputBuffer,
-    ) -> Result<Option<Spanned<Token<'r>>>, Status> {
+        out: &mut CachedToken,
+    ) -> Result<(), Status> {
         let is_root = self.stack.is_empty();
 
         let is_initial = match self.stack.last() {
@@ -305,7 +305,7 @@ impl ScannerInner {
         loop {
             match input.peek()? {
                 Input::Eof if is_root => {
-                    return Ok(None);
+                    return Ok(());
                 }
                 Input::Eof => return Err(Status::Error(std::io::ErrorKind::UnexpectedEof.into())),
                 Input::Value(ch) => match ch {
@@ -325,7 +325,8 @@ impl ScannerInner {
                         _ = input.pop();
                         let end = input.current_location();
 
-                        return Ok(Some(Token::SequenceEndCurly.in_span(start..end)));
+                        out.set(Some(Token::SequenceEndCurly.in_span(start..end)));
+                        return Ok(());
                     }
                     ']' => {
                         self.stack.pop().expect("empty stack");
@@ -334,7 +335,8 @@ impl ScannerInner {
                         _ = input.pop();
                         let end = input.current_location();
 
-                        return Ok(Some(Token::SequenceEndSquare.in_span(start..end)));
+                        out.set(Some(Token::SequenceEndSquare.in_span(start..end)));
+                        return Ok(());
                     }
                     ')' => {
                         self.stack.pop().expect("empty stack");
@@ -342,7 +344,8 @@ impl ScannerInner {
                         _ = input.pop();
                         let end = input.current_location();
 
-                        return Ok(Some(Token::SequenceEndParens.in_span(start..end)));
+                        out.set(Some(Token::SequenceEndParens.in_span(start..end)));
+                        return Ok(());
                     }
                     '#' => {
                         _ = input.pop();
@@ -351,19 +354,21 @@ impl ScannerInner {
                             state: StateType::Comment,
                         });
                         self.current_token.clear();
-                        return self.scan_comment(input).map(Some);
+                        return self.scan_comment(input, out);
                     }
                     '?' => {
                         let start = input.current_location();
                         _ = input.pop();
                         let end = input.current_location();
-                        return Ok(Some(Token::KeySigil.in_span(start..end)));
+                        out.set(Some(Token::KeySigil.in_span(start..end)));
+                        return Ok(());
                     }
                     ':' if !is_initial => {
                         let start = input.current_location();
                         _ = input.pop();
                         let end = input.current_location();
-                        return Ok(Some(Token::Colon.in_span(start..end)));
+                        out.set(Some(Token::Colon.in_span(start..end)));
+                        return Ok(());
                     }
                     '\n' | '\r' if is_initial => {
                         _ = input.pop();
@@ -374,7 +379,7 @@ impl ScannerInner {
                             start: input.current_location(),
                             state: StateType::Delimiter(DelimiterState::default()),
                         });
-                        return self.scan_delimiter(input);
+                        return self.scan_delimiter(input, out);
                     }
                     ' ' | '\t' => {
                         _ = input.pop();
@@ -389,7 +394,7 @@ impl ScannerInner {
                             state: StateType::Tag,
                         });
                         self.current_token.clear();
-                        return self.scan_tag(input).map(Some);
+                        return self.scan_tag(input, out);
                     }
                     '&' => {
                         self.set_current_sequence_has_items();
@@ -400,7 +405,7 @@ impl ScannerInner {
                             state: StateType::Ref,
                         });
                         self.current_token.clear();
-                        return self.scan_ref(input).map(Some);
+                        return self.scan_ref(input, out);
                     }
                     '*' => {
                         self.set_current_sequence_has_items();
@@ -411,18 +416,19 @@ impl ScannerInner {
                             state: StateType::Merge,
                         });
                         self.current_token.clear();
-                        return self.scan_merge(input).map(Some);
+                        return self.scan_merge(input, out);
                     }
-                    _ => return self.begin_value(input).map(Some),
+                    _ => return self.begin_value(input, out),
                 },
             }
         }
     }
 
-    fn begin_value<'r>(
-        &'r mut self,
+    fn begin_value(
+        &mut self,
         input: &mut InputBuffer,
-    ) -> Result<Spanned<Token<'r>>, Status> {
+        token: &mut CachedToken,
+    ) -> Result<(), Status> {
         self.current_token.clear();
 
         match input.peek2()? {
@@ -433,7 +439,7 @@ impl ScannerInner {
                     state: StateType::QuotedScalarTrimWhitespace,
                 });
                 _ = input.pop2();
-                self.scan_quoted(input)
+                self.scan_quoted(input, token)
             }
             [Input::Value('|'), Input::Value('"')] => {
                 self.set_current_sequence_has_items();
@@ -442,7 +448,7 @@ impl ScannerInner {
                     state: StateType::QuotedScalarTrimIndent,
                 });
                 _ = input.pop2();
-                self.scan_quoted(input)
+                self.scan_quoted(input, token)
             }
             [Input::Value('"'), _] => {
                 self.set_current_sequence_has_items();
@@ -451,7 +457,7 @@ impl ScannerInner {
                     state: StateType::QuotedScalar,
                 });
                 _ = input.pop();
-                self.scan_quoted(input)
+                self.scan_quoted(input, token)
             }
             [Input::Value('\''), _] => {
                 self.set_current_sequence_has_items();
@@ -460,7 +466,7 @@ impl ScannerInner {
                     state: StateType::SingleQuotedScalar,
                 });
                 _ = input.pop();
-                self.scan_quoted(input)
+                self.scan_quoted(input, token)
             }
             [Input::Value('{'), _] => {
                 self.set_current_sequence_has_items();
@@ -471,7 +477,8 @@ impl ScannerInner {
                 });
                 _ = input.pop();
                 let end = input.current_location();
-                Ok(Token::SequenceStartCurly.in_span(start..end))
+                token.set(Some(Token::SequenceStartCurly.in_span(start..end)));
+                return Ok(());
             }
             [Input::Value('['), _] => {
                 self.set_current_sequence_has_items();
@@ -482,7 +489,8 @@ impl ScannerInner {
                 });
                 _ = input.pop();
                 let end = input.current_location();
-                Ok(Token::SequenceStartSquare.in_span(start..end))
+                token.set(Some(Token::SequenceStartSquare.in_span(start..end)));
+                return Ok(());
             }
             [Input::Value('('), _] => {
                 self.set_current_sequence_has_items();
@@ -493,7 +501,8 @@ impl ScannerInner {
                 });
                 _ = input.pop();
                 let end = input.current_location();
-                Ok(Token::SequenceStartParens.in_span(start..end))
+                token.set(Some(Token::SequenceStartParens.in_span(start..end)));
+                Ok(())
             }
             [Input::Value(ch), _] => {
                 if ch.is_whitespace() {
@@ -505,7 +514,7 @@ impl ScannerInner {
                     start: input.current_location(),
                     state: StateType::PlainScalar,
                 });
-                self.scan_plain(input)
+                self.scan_plain(input, token)
             }
             [Input::Eof, _] => {
                 panic!(
@@ -515,7 +524,11 @@ impl ScannerInner {
         }
     }
 
-    fn scan_plain<'r>(&'r mut self, input: &mut InputBuffer) -> Result<Spanned<Token<'r>>, Status> {
+    fn scan_plain(
+        &mut self,
+        input: &mut InputBuffer,
+        token: &mut CachedToken,
+    ) -> Result<(), Status> {
         loop {
             match input.peek2()? {
                 [Input::Value(':'), Input::Value(':')] => {
@@ -546,13 +559,14 @@ impl ScannerInner {
             panic!("inconsistent stack (rule: plain scalar)")
         };
 
-        Ok(
+        token.set(Some(
             Token::Scalar(Scalar::new(&self.current_token, ScalarStyle::Plain))
                 .in_span(start..input.current_location()),
-        )
+        ));
+        Ok(())
     }
 
-    fn scan_tag<'r>(&'r mut self, input: &mut InputBuffer) -> Result<Spanned<Token<'r>>, Status> {
+    fn scan_tag(&mut self, input: &mut InputBuffer, token: &mut CachedToken) -> Result<(), Status> {
         self.scan_complete_ident(input)?;
         if self.current_token.is_empty() {
             return Err(ScannerError::UnexpectedChar('@').into());
@@ -566,10 +580,13 @@ impl ScannerInner {
             panic!("inconsistent stack (rule: tag)")
         };
 
-        Ok(Token::Anchor(&self.current_token).in_span(start..input.current_location()))
+        token.set(Some(
+            Token::Anchor(&self.current_token).in_span(start..input.current_location()),
+        ));
+        Ok(())
     }
 
-    fn scan_ref<'r>(&'r mut self, input: &mut InputBuffer) -> Result<Spanned<Token<'r>>, Status> {
+    fn scan_ref(&mut self, input: &mut InputBuffer, token: &mut CachedToken) -> Result<(), Status> {
         self.scan_complete_ident(input)?;
         if self.current_token.is_empty() {
             return Err(ScannerError::UnexpectedChar('&').into());
@@ -583,10 +600,17 @@ impl ScannerInner {
             panic!("inconsistent stack (rule: ref)")
         };
 
-        Ok(Token::Ref(&self.current_token).in_span(start..input.current_location()))
+        token.set(Some(
+            Token::Ref(&self.current_token).in_span(start..input.current_location()),
+        ));
+        Ok(())
     }
 
-    fn scan_merge<'r>(&'r mut self, input: &mut InputBuffer) -> Result<Spanned<Token<'r>>, Status> {
+    fn scan_merge(
+        &mut self,
+        input: &mut InputBuffer,
+        token: &mut CachedToken,
+    ) -> Result<(), Status> {
         self.scan_complete_ident(input)?;
         if self.current_token.is_empty() {
             return Err(ScannerError::UnexpectedChar('*').into());
@@ -600,7 +624,10 @@ impl ScannerInner {
             panic!("inconsistent stack (rule: merge)")
         };
 
-        Ok(Token::Merge(&self.current_token).in_span(start..input.current_location()))
+        token.set(Some(
+            Token::Merge(&self.current_token).in_span(start..input.current_location()),
+        ));
+        Ok(())
     }
 
     fn scan_complete_ident(&mut self, input: &mut InputBuffer) -> Result<(), Status> {
@@ -615,10 +642,11 @@ impl ScannerInner {
         }
     }
 
-    fn scan_quoted<'r>(
-        &'r mut self,
+    fn scan_quoted(
+        &mut self,
         input: &mut InputBuffer,
-    ) -> Result<Spanned<Token<'r>>, Status> {
+        token: &mut CachedToken,
+    ) -> Result<(), Status> {
         let (state, start) = if let State {
             state:
                 state @ (StateType::QuotedScalar
@@ -689,7 +717,7 @@ impl ScannerInner {
 
         self.stack.pop();
 
-        Ok(match state {
+        let scalar_token = match state {
             StateType::QuotedScalar => {
                 Token::Scalar(Scalar::new(&self.current_token, ScalarStyle::Quoted))
             }
@@ -710,13 +738,16 @@ impl ScannerInner {
             }
             _ => unreachable!(),
         }
-        .in_span(start..input.current_location()))
+        .in_span(start..input.current_location());
+        token.set(Some(scalar_token));
+        Ok(())
     }
 
-    fn scan_comment<'r>(
-        &'r mut self,
+    fn scan_comment(
+        &mut self,
         input: &mut InputBuffer,
-    ) -> Result<Spanned<Token<'r>>, Status> {
+        token: &mut CachedToken,
+    ) -> Result<(), Status> {
         assert!(matches!(
             self.stack.last(),
             Some(State {
@@ -753,7 +784,10 @@ impl ScannerInner {
             panic!("inconsistent stack (rule: comment)")
         };
 
-        Ok(Token::Comment(&self.current_token).in_span(start..input.current_location()))
+        token.set(Some(
+            Token::Comment(&self.current_token).in_span(start..input.current_location()),
+        ));
+        Ok(())
     }
 }
 
@@ -765,10 +799,16 @@ mod tests {
     fn assert_tokens_eq(input: &str, expected: &[Token]) {
         let mut scanner = Scanner::new(input.as_bytes());
         let mut tokens = vec![];
+        let mut cached = CachedToken::default();
         loop {
-            match scanner.next_token() {
-                Ok(Some(token)) => tokens.push(token.value.to_owned()),
-                Ok(None) => break,
+            match scanner.next_token(&mut cached) {
+                Ok(_) => {
+                    if cached.is_some() {
+                        tokens.push(std::mem::take(&mut cached))
+                    } else {
+                        break;
+                    }
+                }
                 Err(e) => panic!("error: {}", e),
             }
         }
@@ -779,10 +819,16 @@ mod tests {
     fn assert_tokens_err(input: &str, expected: ScannerError) {
         let mut scanner = Scanner::new(input.as_bytes());
         let mut tokens = vec![];
+        let mut cached = CachedToken::default();
         loop {
-            match scanner.next_token() {
-                Ok(Some(token)) => tokens.push(token.value.to_owned()),
-                Ok(None) => break,
+            match scanner.next_token(&mut cached) {
+                Ok(_) => {
+                    if cached.is_some() {
+                        tokens.push(std::mem::take(&mut cached))
+                    } else {
+                        break;
+                    }
+                }
                 Err(e) => {
                     assert_eq!(e, expected);
                     return;

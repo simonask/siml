@@ -443,7 +443,12 @@ impl Document {
         anchor: Option<&str>,
         type_tag: Option<NodeId>,
     ) -> Result<NodeId, BuilderError> {
-        self.add_spanned_sequence(style, None, None, Span::default())
+        self.add_spanned_sequence(
+            style,
+            anchor.map(|anchor| anchor.to_owned().in_span(Span::default())),
+            type_tag,
+            Span::default(),
+        )
     }
 
     /// Complete a previously added sequence.
@@ -509,7 +514,7 @@ impl Document {
         if let Some(incomplete) = self.incomplete_anchors.iter().next() {
             return Err(BuilderError::IncompleteAnchor(incomplete.clone()));
         }
-        if let Some(incomplete) = self.incomplete_sequences.iter().next() {
+        if let Some(_incomplete) = self.incomplete_sequences.iter().next() {
             panic!("add_sequence() was called without a corresponding call to complete_sequence()");
         }
         Ok(())

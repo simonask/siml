@@ -1,4 +1,4 @@
-use crate::{OwnedScalar, Scalar, ScalarStyle, Span, Spanned, SpannedExt};
+use crate::{Scalar, ScalarStyle, Span, Spanned, SpannedExt};
 
 #[derive(Clone, Copy, Debug)]
 pub enum Event<'r> {
@@ -18,8 +18,7 @@ pub enum Event<'r> {
     /// End a sequence.
     EndSequence(Span),
     /// Begin a mapping. Key/value pairs are emitted for each entry. Values
-    /// without keys (sequence-like entries) are preceded by an `EmptyKey`
-    /// event.
+    /// without keys (sequence-like items) are preceded by an `EmptyKey` event.
     BeginMapping {
         span: Span,
         type_tag: Option<Spanned<Scalar<'r>>>,
@@ -29,11 +28,11 @@ pub enum Event<'r> {
     EndMapping(Span),
     /// Artificial event indicating an empty value.
     ///
-    /// This is emitted artificially (with no relation to any particular token)
-    /// by the parser in the following two circumstances:
+    /// This may be emitted synthetically (with no relation to any particular
+    /// token) by the parser in the following two circumstances:
     ///
     /// 1. A free-standing ("keyless") value in a mapping, where the mapping is
-    ///    treated as having sequence-like elements.
+    ///    treated as having sequence-like items.
     /// 2. An empty value in a mapping, i.e. `:` followed by a newline. Note
     ///    that a trailing comma is not allowed in this case.
     Empty(Span),
@@ -163,130 +162,205 @@ pub enum SequenceStyle {
     Tuple,
 }
 
-#[derive(Clone, Debug, Hash)]
-pub enum OwnedEvent {
-    /// A scalar value.
-    Scalar(Spanned<OwnedScalar>),
-    /// A reference to a value that has previously been assigned an anchor.
-    Ref(Spanned<String>),
-    /// Merge a sequence with an anchor into the current sequence.
-    Merge(Spanned<String>),
-    /// Begin a sequence.
-    BeginSequence {
-        span: Span,
-        style: SequenceStyle,
-        type_tag: Option<Spanned<OwnedScalar>>,
-        anchor: Option<Spanned<String>>,
-    },
-    /// End a sequence.
-    EndSequence(Span),
-    /// Begin a mapping. Key/value pairs are emitted for each entry. Values
-    /// without keys (sequence-like entries) are preceded by an `EmptyKey`
-    /// event.
-    BeginMapping {
-        span: Span,
-        type_tag: Option<Spanned<OwnedScalar>>,
-        anchor: Option<Spanned<String>>,
-    },
-    /// End a mapping.
-    EndMapping(Span),
-    /// Artificial event indicating an empty value.
-    ///
-    /// This is emitted artificially (with no relation to any particular token)
-    /// by the parser in the following two circumstances:
-    ///
-    /// 1. A free-standing ("keyless") value in a mapping, where the mapping is
-    ///    treated as having sequence-like elements.
-    /// 2. An empty value in a mapping, i.e. `:` followed by a newline. Note
-    ///    that a trailing comma is not allowed in this case.
-    Empty(Span),
-    /// Comment
-    Comment(Spanned<String>),
+/// Event type (without associated data).
+///
+/// See [`Event`] for the full event type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EventType {
+    Scalar(ScalarStyle),
+    Ref,
+    Merge,
+    BeginSequence(SequenceStyle),
+    EndSequence,
+    BeginMapping,
+    EndMapping,
+    Empty,
+    Comment,
 }
 
-impl PartialEq<Event<'_>> for OwnedEvent {
-    #[inline]
-    fn eq(&self, other: &Event<'_>) -> bool {
-        self.borrow() == *other
+/// An owned event.
+///
+/// `CachedToken` holds an `Option<Event>`, but stores the strings inside the
+/// event such that allocations are amortized when calling
+/// `CachedEvent::set()`.
+#[derive(Clone, Debug, Default)]
+pub struct CachedEvent {
+    ty: Option<(EventType, Span)>,
+    scalar_or_type_tag_buffer: String,
+    type_tag_span: Option<Span>,
+    anchor_buffer: String,
+    anchor_span: Option<Span>,
+}
+
+impl CachedEvent {
+    pub fn is_some(&self) -> bool {
+        self.ty.is_some()
     }
-}
 
-impl OwnedEvent {
-    pub fn borrow(&self) -> Event {
-        match self {
-            OwnedEvent::Scalar(scalar) => Event::Scalar(scalar.as_ref().map(OwnedScalar::borrow)),
-            OwnedEvent::Ref(r) => Event::Ref(r.as_ref().map(String::as_str)),
-            OwnedEvent::Merge(m) => Event::Merge(m.as_ref().map(String::as_str)),
-            OwnedEvent::BeginSequence {
+    /// Get the stored event.
+    pub fn get(&self) -> Option<Event<'_>> {
+        let Some((ty, span)) = self.ty else {
+            return None;
+        };
+        let anchor = self
+            .anchor_span
+            .map(|anchor_span| self.anchor_buffer.as_str().in_span(anchor_span));
+        let type_tag = self.type_tag_span.map(|type_tag_span| {
+            Scalar {
+                value: &self.scalar_or_type_tag_buffer.as_str(),
+                style: ScalarStyle::Plain, // TODO: Preserve scalar style
+                anchor: None,
+            }
+            .in_span(type_tag_span)
+        });
+
+        Some(match ty {
+            EventType::Scalar(style) => Event::Scalar(
+                Scalar {
+                    value: &self.scalar_or_type_tag_buffer,
+                    style,
+                    anchor: anchor.map(Spanned::into_inner), // TODO: Preserve span
+                }
+                .in_span(span),
+            ),
+            EventType::Ref => Event::Ref(self.scalar_or_type_tag_buffer.as_str().in_span(span)),
+            EventType::Merge => Event::Merge(self.scalar_or_type_tag_buffer.as_str().in_span(span)),
+            EventType::BeginSequence(style) => Event::BeginSequence {
                 span,
                 style,
                 type_tag,
                 anchor,
-            } => Event::BeginSequence {
-                span: *span,
-                style: *style,
-                type_tag: type_tag
-                    .as_ref()
-                    .map(|t| t.as_ref().map(OwnedScalar::borrow)),
-                anchor: anchor.as_ref().map(|a| a.as_ref().map(String::as_ref)),
             },
-            OwnedEvent::EndSequence(span) => Event::EndSequence(*span),
-            OwnedEvent::BeginMapping {
+            EventType::EndSequence => Event::EndSequence(span),
+            EventType::BeginMapping => Event::BeginMapping {
                 span,
                 type_tag,
                 anchor,
-            } => Event::BeginMapping {
-                span: *span,
-                type_tag: type_tag
-                    .as_ref()
-                    .map(|t| t.as_ref().map(OwnedScalar::borrow)),
-                anchor: anchor.as_ref().map(|a| a.as_ref().map(String::as_ref)),
             },
-            OwnedEvent::EndMapping(span) => Event::EndMapping(*span),
-            OwnedEvent::Empty(span) => Event::Empty(*span),
-            OwnedEvent::Comment(c) => Event::Comment(c.as_ref().map(String::as_str)),
-        }
+            EventType::EndMapping => Event::EndMapping(span),
+            EventType::Empty => Event::Empty(span),
+            EventType::Comment => {
+                Event::Comment(self.scalar_or_type_tag_buffer.as_str().in_span(span))
+            }
+        })
     }
-}
 
-impl<'r> Event<'r> {
-    #[inline]
-    pub fn to_owned(self) -> OwnedEvent {
-        match self {
-            Event::Scalar(scalar) => OwnedEvent::Scalar(scalar.map(Scalar::to_owned)),
-            Event::Ref(r) => OwnedEvent::Ref(r.map(ToOwned::to_owned)),
-            Event::Merge(m) => OwnedEvent::Merge(m.map(ToOwned::to_owned)),
+    pub fn clear(&mut self) {
+        self.ty = None;
+        self.scalar_or_type_tag_buffer.clear();
+        self.type_tag_span = None;
+        self.anchor_buffer.clear();
+        self.anchor_span = None;
+    }
+
+    /// Set the stored event.
+    pub fn set(&mut self, event: Option<Event>) {
+        self.clear();
+        let Some(event) = event else {
+            return;
+        };
+
+        match event {
+            Event::Scalar(Spanned {
+                value:
+                    Scalar {
+                        value,
+                        style,
+                        anchor,
+                    },
+                span,
+            }) => {
+                self.ty = Some((EventType::Scalar(style), span));
+                self.scalar_or_type_tag_buffer.push_str(value);
+                if let Some(anchor) = anchor {
+                    self.anchor_buffer.push_str(anchor);
+                    self.anchor_span = Some(Span::default()); // TODO: Preserve span
+                }
+            }
+            Event::Ref(Spanned { value, span }) => {
+                self.ty = Some((EventType::Ref, span));
+                self.scalar_or_type_tag_buffer.push_str(value);
+            }
+            Event::Merge(Spanned { value, span }) => {
+                self.ty = Some((EventType::Merge, span));
+                self.scalar_or_type_tag_buffer.push_str(value);
+            }
             Event::BeginSequence {
                 span,
                 style,
                 type_tag,
                 anchor,
-            } => OwnedEvent::BeginSequence {
-                span,
-                style,
-                type_tag: type_tag.map(|t| t.map(Scalar::to_owned)),
-                anchor: anchor.map(|a| a.map(ToOwned::to_owned)),
-            },
-            Event::EndSequence(span) => OwnedEvent::EndSequence(span),
+            } => {
+                self.ty = Some((EventType::BeginSequence(style), span));
+                if let Some(type_tag) = type_tag {
+                    self.scalar_or_type_tag_buffer
+                        .push_str(type_tag.value.value);
+                    self.type_tag_span = Some(type_tag.span);
+                }
+                if let Some(anchor) = anchor {
+                    self.anchor_buffer.push_str(anchor.value);
+                    self.anchor_span = Some(Span::default()); // TODO: Preserve span
+                }
+            }
+            Event::EndSequence(span) => {
+                self.ty = Some((EventType::EndSequence, span));
+            }
             Event::BeginMapping {
                 span,
                 type_tag,
                 anchor,
-            } => OwnedEvent::BeginMapping {
-                span,
-                type_tag: type_tag.map(|t| t.map(Scalar::to_owned)),
-                anchor: anchor.map(|a| a.map(ToOwned::to_owned)),
-            },
-            Event::EndMapping(span) => OwnedEvent::EndMapping(span),
-            Event::Empty(span) => OwnedEvent::Empty(span),
-            Event::Comment(c) => OwnedEvent::Comment(c.map(ToOwned::to_owned)),
+            } => {
+                self.ty = Some((EventType::BeginMapping, span));
+                if let Some(type_tag) = type_tag {
+                    self.scalar_or_type_tag_buffer
+                        .push_str(type_tag.value.value);
+                    self.type_tag_span = Some(type_tag.span);
+                }
+                if let Some(anchor) = anchor {
+                    self.anchor_buffer.push_str(anchor.value);
+                    self.anchor_span = Some(Span::default()); // TODO: Preserve span
+                }
+            }
+            Event::EndMapping(span) => {
+                self.ty = Some((EventType::EndMapping, span));
+            }
+            Event::Empty(span) => {
+                self.ty = Some((EventType::Empty, span));
+            }
+            Event::Comment(comment) => {
+                self.ty = Some((EventType::Comment, comment.span));
+                self.scalar_or_type_tag_buffer.push_str(comment.value);
+            }
         }
     }
 }
 
-impl<'r> From<&'r OwnedEvent> for Event<'r> {
+impl From<Event<'_>> for CachedEvent {
     #[inline]
-    fn from(event: &'r OwnedEvent) -> Self {
-        event.borrow()
+    fn from(event: Event<'_>) -> Self {
+        let mut cached = CachedEvent::default();
+        cached.set(Some(event));
+        cached
+    }
+}
+
+impl PartialEq<Event<'_>> for CachedEvent {
+    #[inline]
+    fn eq(&self, other: &Event<'_>) -> bool {
+        self.get() == Some(*other)
+    }
+}
+
+impl<'r> Event<'r> {
+    #[inline]
+    pub fn to_owned(self) -> CachedEvent {
+        CachedEvent::from(self)
+    }
+}
+
+impl<'r> From<&'r CachedEvent> for Option<Event<'r>> {
+    #[inline]
+    fn from(event: &'r CachedEvent) -> Self {
+        event.get()
     }
 }

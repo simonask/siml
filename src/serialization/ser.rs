@@ -1,4 +1,4 @@
-use crate::{Builder, BuilderError, Document, NodeId, OwnedScalar, Scalar, SequenceStyle};
+use crate::{BuilderError, Document, NodeId, Scalar, SequenceStyle};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SerializationError {
@@ -32,7 +32,7 @@ type Impossible = serde::ser::Impossible<RootSerializer, SerializationError>;
 
 impl RootSerializer {
     #[inline]
-    pub fn finish(mut self) -> Result<Document, SerializationError> {
+    pub fn finish(self) -> Result<Document, SerializationError> {
         self.doc.check_complete()?;
         Ok(self.doc)
     }

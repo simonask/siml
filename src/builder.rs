@@ -1,8 +1,9 @@
 use std::io::BufRead;
 
 use crate::{
-    Document, Error, NodeData, NodeId, OwnedEvent, OwnedScalar, ParseStream, Scalar, ScalarStyle,
-    ScannerError, SequenceItem, SequenceNode, SequenceStyle, Spanned, SpannedExt, Value,
+    CachedEvent, Document, Error, Event, NodeData, NodeId, OwnedScalar, ParseStream, Scalar,
+    ScalarStyle, ScannerError, SequenceItem, SequenceNode, SequenceStyle, Spanned, SpannedExt,
+    Value,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -94,35 +95,45 @@ impl<'b> MappingBuilder<'b> {
     ) -> Result<(), Error> {
         let mut pending_key: Option<Option<NodeId>> = None;
 
+        let mut event = CachedEvent::default();
         loop {
-            let Some(event) = parser.next_event()? else {
+            parser.next_event(&mut event)?;
+            let Some(event) = event.get() else {
                 if !is_root {
                     return Err(ScannerError::UnexpectedEof.into());
                 } else {
                     return Ok(());
                 }
             };
-            let event = event.to_owned();
 
             let key_or_value = match event {
-                OwnedEvent::Scalar(scalar) => Some(self.builder.doc.add_spanned_scalar(scalar)?),
-                OwnedEvent::Ref(anchor) => Some(self.builder.doc.resolve_anchor(&anchor)?),
-                OwnedEvent::Merge(anchor) => {
+                Event::Scalar(scalar) => Some(
+                    self.builder
+                        .doc
+                        .add_spanned_scalar(scalar.map(Scalar::to_owned))?,
+                ),
+                Event::Ref(anchor) => Some(self.builder.doc.resolve_anchor(&anchor)?),
+                Event::Merge(anchor) => {
                     if pending_key.is_some() {
                         return Err(BuilderError::UnexpectedEvent.into());
                     }
                     self.builder.merge(self.node, &anchor)?;
                     continue;
                 }
-                OwnedEvent::BeginSequence {
+                Event::BeginSequence {
                     span,
                     style,
                     type_tag,
                     anchor,
                 } => {
                     let type_tag = type_tag
-                        .map(|type_tag| self.builder.doc.add_spanned_scalar(type_tag))
+                        .map(|type_tag| {
+                            self.builder
+                                .doc
+                                .add_spanned_scalar(type_tag.map(Scalar::to_owned))
+                        })
                         .transpose()?;
+                    let anchor = anchor.map(|anchor| anchor.map(ToOwned::to_owned));
 
                     let seq_id = self
                         .builder
@@ -137,15 +148,20 @@ impl<'b> MappingBuilder<'b> {
                     seq_builder.parse(parser)?;
                     Some(seq_id)
                 }
-                OwnedEvent::EndSequence(_) => return Err(BuilderError::UnexpectedEvent.into()),
-                OwnedEvent::BeginMapping {
+                Event::EndSequence(_) => return Err(BuilderError::UnexpectedEvent.into()),
+                Event::BeginMapping {
                     span,
                     type_tag,
                     anchor,
                 } => {
                     let type_tag = type_tag
-                        .map(|type_tag| self.builder.doc.add_spanned_scalar(type_tag))
+                        .map(|type_tag| {
+                            self.builder
+                                .doc
+                                .add_spanned_scalar(type_tag.map(Scalar::to_owned))
+                        })
                         .transpose()?;
+                    let anchor = anchor.map(|anchor| anchor.map(ToOwned::to_owned));
 
                     let submap_id = self.builder.doc.add_spanned_sequence(
                         SequenceStyle::Mapping,
@@ -160,13 +176,13 @@ impl<'b> MappingBuilder<'b> {
                     submap_builder.parse(parser, false)?;
                     Some(submap_id)
                 }
-                OwnedEvent::EndMapping(_) => {
+                Event::EndMapping(_) => {
                     if pending_key.is_some() {
                         return Err(BuilderError::UnexpectedEvent.into());
                     }
                     return Ok(());
                 }
-                OwnedEvent::Empty(span) => {
+                Event::Empty(span) => {
                     if pending_key.is_some() {
                         Some(
                             self.builder
@@ -177,7 +193,7 @@ impl<'b> MappingBuilder<'b> {
                         None
                     }
                 }
-                OwnedEvent::Comment(_) => continue,
+                Event::Comment(_) => continue,
             };
 
             if let Some(key) = pending_key.take() {
@@ -238,28 +254,39 @@ impl<'b> Drop for MappingBuilder<'b> {
 
 impl<'b> SequenceBuilder<'b> {
     fn parse<R: BufRead>(&mut self, parser: &mut ParseStream<R>) -> Result<(), Error> {
+        let mut event = CachedEvent::default();
         loop {
-            let Some(event) = parser.next_event()? else {
+            parser.next_event(&mut event)?;
+            let Some(event) = event.get() else {
                 return Err(ScannerError::UnexpectedEof.into());
             };
-            let event = event.to_owned();
 
             let value = match event {
-                OwnedEvent::Scalar(scalar) => self.inner.builder.doc.add_spanned_scalar(scalar)?,
-                OwnedEvent::Ref(anchor) => self.inner.builder.doc.resolve_anchor(&anchor)?,
-                OwnedEvent::Merge(anchor) => {
+                Event::Scalar(scalar) => self
+                    .inner
+                    .builder
+                    .doc
+                    .add_spanned_scalar(scalar.map(Scalar::to_owned))?,
+                Event::Ref(anchor) => self.inner.builder.doc.resolve_anchor(&anchor)?,
+                Event::Merge(anchor) => {
                     self.inner.builder.merge(self.inner.node, &anchor)?;
                     continue;
                 }
-                OwnedEvent::BeginSequence {
+                Event::BeginSequence {
                     span,
                     style,
                     type_tag,
                     anchor,
                 } => {
                     let type_tag = type_tag
-                        .map(|type_tag| self.inner.builder.doc.add_spanned_scalar(type_tag))
+                        .map(|type_tag| {
+                            self.inner
+                                .builder
+                                .doc
+                                .add_spanned_scalar(type_tag.map(Scalar::to_owned))
+                        })
                         .transpose()?;
+                    let anchor = anchor.map(|anchor| anchor.map(ToOwned::to_owned));
 
                     let seq_id = self
                         .inner
@@ -275,18 +302,24 @@ impl<'b> SequenceBuilder<'b> {
                     seq_builder.parse(parser)?;
                     seq_id
                 }
-                OwnedEvent::EndSequence(span) => {
+                Event::EndSequence(span) => {
                     // TODO: Merge spans
                     return Ok(());
                 }
-                OwnedEvent::BeginMapping {
+                Event::BeginMapping {
                     span,
                     type_tag,
                     anchor,
                 } => {
                     let type_tag = type_tag
-                        .map(|type_tag| self.inner.builder.doc.add_spanned_scalar(type_tag))
+                        .map(|type_tag| {
+                            self.inner
+                                .builder
+                                .doc
+                                .add_spanned_scalar(type_tag.map(Scalar::to_owned))
+                        })
                         .transpose()?;
+                    let anchor = anchor.map(|anchor| anchor.map(ToOwned::to_owned));
 
                     let submap_id = self.inner.builder.doc.add_spanned_sequence(
                         SequenceStyle::Mapping,
@@ -301,8 +334,8 @@ impl<'b> SequenceBuilder<'b> {
                     submap_builder.parse(parser, false)?;
                     submap_id
                 }
-                OwnedEvent::EndMapping(_) => return Err(BuilderError::UnexpectedEvent.into()),
-                OwnedEvent::Empty(span) => self.inner.builder.doc.add_spanned_scalar(Spanned {
+                Event::EndMapping(_) => return Err(BuilderError::UnexpectedEvent.into()),
+                Event::Empty(span) => self.inner.builder.doc.add_spanned_scalar(Spanned {
                     value: OwnedScalar {
                         style: ScalarStyle::Plain,
                         value: String::new(),
@@ -310,7 +343,7 @@ impl<'b> SequenceBuilder<'b> {
                     },
                     span,
                 })?,
-                OwnedEvent::Comment(_) => continue,
+                Event::Comment(_) => continue,
             };
 
             self.inner.seq().items.push(SequenceItem {

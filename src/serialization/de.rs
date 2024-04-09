@@ -866,8 +866,3 @@ where
         seed.deserialize(&self.seq.items[index].1)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-}
