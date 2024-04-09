@@ -12,6 +12,7 @@ mod scanner;
 mod token;
 mod value;
 
+pub mod api;
 mod builder;
 mod emitter;
 #[cfg(feature = "serde")]
