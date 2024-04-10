@@ -12,14 +12,16 @@
 #ifndef SIML_H_INCLUDED
 #define SIML_H_INCLUDED
 
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
+#ifndef SIML_API
 #ifdef __cplusplus
 #define SIML_API extern "C"
 #else
 #define SIML_API
-#endif
+#endif // __cplusplus
+#endif // !defined(SIML_API)
 
 typedef struct _siml_document_s siml_document_t;
 typedef struct _siml_parser_s siml_parser_t;

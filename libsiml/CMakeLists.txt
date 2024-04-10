@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.0)
 project(libsiml)
 enable_language(C)
 include(GNUInstallDirs)
+set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 find_program(CARGO
     NAMES cargo
@@ -21,7 +22,7 @@ else()
     set(CARGO_PROFILE "release")
 endif()
 
-set(LIBSIML_STATICLIB "${CARGO_TARGET_DIR}/${CARGO_PROFILE}/${CMAKE_STATIC_LIBRARY_PREFIX}libsiml${CMAKE_STATIC_LIBRARY_SUFFIX}")
+set(LIBSIML_STATICLIB "${CARGO_TARGET_DIR}/${CARGO_PROFILE}/${CMAKE_STATIC_LIBRARY_PREFIX}siml_static${CMAKE_STATIC_LIBRARY_SUFFIX}")
 
 add_custom_command(
     OUTPUT "${LIBSIML_STATICLIB}"
@@ -60,8 +61,10 @@ set_target_properties(libsiml_shared PROPERTIES OUTPUT_NAME siml)
 if (UNIX)
     target_link_libraries(libsiml_shared "-Wl,--whole-archive \"${LIBSIML_STATICLIB}\" -Wl,--no-whole-archive")
 elseif(MSVC)
-    target_link_libraries(libsiml_shared "/WHOLEARCHIVE:\"${LIBSIML_STATICLIB}\"")
+    target_link_libraries(libsiml_shared libsiml_static)
+    set_target_properties(libsiml_shared PROPERTIES LINK_FLAGS "/WHOLEARCHIVE:\"${LIBSIML_STATICLIB}\"")
 endif()
+
 target_include_directories(libsiml_shared
     PUBLIC
         "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>/include"
@@ -91,7 +94,7 @@ include(CPack)
 include(CTest)
 enable_testing()
 add_executable(siml-test test.c)
-target_link_libraries(siml-test libsiml_static)
+target_link_libraries(siml-test libsiml_shared)
 if(MSVC)
   target_compile_options(siml-test PRIVATE /W4 /c)
 else()

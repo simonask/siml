@@ -5,6 +5,7 @@ edition = "2021"
 resolver = "2"
 
 [lib]
+name = "siml_static"
 crate-type = ["staticlib"]
 
 [dependencies.siml]
