@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/siml-fmt"]
+members = ["crates/siml-fmt", "libsiml"]
 
 [package]
 name = "siml"

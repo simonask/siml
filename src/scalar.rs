@@ -191,15 +191,6 @@ impl<'r> Scalar<'r> {
     }
 
     #[inline]
-    pub fn to_owned(self) -> OwnedScalar {
-        OwnedScalar {
-            style: self.style,
-            value: self.value.to_owned(),
-            anchor: self.anchor.map(|a| a.to_owned()),
-        }
-    }
-
-    #[inline]
     pub fn with_anchor(self, anchor: impl Into<Option<&'r str>>) -> Self {
         Self {
             anchor: anchor.into(),
@@ -208,126 +199,9 @@ impl<'r> Scalar<'r> {
     }
 }
 
-#[derive(Debug, Clone, Eq)]
-pub struct OwnedScalar {
-    pub value: String,
-    pub style: ScalarStyle,
-    pub anchor: Option<String>,
-}
-
-impl OwnedScalar {
-    pub fn plain(value: impl Into<String>) -> Self {
-        Self {
-            style: ScalarStyle::Plain,
-            value: value.into(),
-            anchor: None,
-        }
-    }
-
-    pub fn infer_style(value: impl Into<String>) -> Self {
-        let value = value.into();
-        let style = ScalarStyle::infer(&value);
-        Self {
-            style,
-            value,
-            anchor: None,
-        }
-    }
-
-    pub fn integer(value: impl itoa::Integer) -> Self {
-        Self {
-            style: ScalarStyle::Plain,
-            value: itoa::Buffer::new().format(value).to_string(),
-            anchor: None,
-        }
-    }
-
-    pub fn float(value: impl ryu::Float) -> Self {
-        Self {
-            style: ScalarStyle::Plain,
-            value: ryu::Buffer::new().format(value).to_string(),
-            anchor: None,
-        }
-    }
-}
-
-impl Ord for OwnedScalar {
-    #[inline]
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.value.cmp(&other.value)
-    }
-}
-
-impl std::hash::Hash for OwnedScalar {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.value.hash(state);
-    }
-}
-
-impl PartialOrd for OwnedScalar {
-    #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.value.partial_cmp(&other.value)
-    }
-}
-
-impl PartialEq for OwnedScalar {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.value == other.value
-    }
-}
-
-impl PartialEq<Scalar<'_>> for OwnedScalar {
-    #[inline]
-    fn eq(&self, other: &Scalar<'_>) -> bool {
-        self.value == other.value
-    }
-}
-
-impl PartialEq<OwnedScalar> for Scalar<'_> {
-    #[inline]
-    fn eq(&self, other: &OwnedScalar) -> bool {
-        self.value == other.value
-    }
-}
-
-impl OwnedScalar {
-    #[inline]
-    pub fn borrow(&self) -> Scalar {
-        Scalar {
-            style: self.style,
-            value: &self.value,
-            anchor: self.anchor.as_deref(),
-        }
-    }
-
-    #[inline]
-    pub fn with_anchor(self, anchor: impl Into<Option<String>>) -> Self {
-        Self {
-            anchor: anchor.into(),
-            ..self
-        }
-    }
-}
-
-impl<'r> From<Scalar<'r>> for OwnedScalar {
-    #[inline]
-    fn from(scalar: Scalar) -> OwnedScalar {
-        scalar.to_owned()
-    }
-}
-
 impl<'r> AsRef<str> for Scalar<'r> {
     #[inline]
     fn as_ref(&self) -> &str {
         self.value
-    }
-}
-
-impl AsRef<str> for OwnedScalar {
-    #[inline]
-    fn as_ref(&self) -> &str {
-        &self.value
     }
 }

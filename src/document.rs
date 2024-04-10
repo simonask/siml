@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    Builder, BuilderError, Error, MappingBuilder, OwnedScalar, ParseStream, Scalar, ScalarStyle,
+    builder::MappingBuilder, Builder, BuilderError, Error, ParseStream, Scalar, ScalarStyle,
     Sequence, SequenceStyle, Span, Spanned, SpannedExt, SpannedSequence, SpannedValue, Value,
 };
 
@@ -36,7 +36,7 @@ impl Default for Document {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct Node {
+pub struct Node {
     pub anchor: Option<Spanned<String>>,
     pub data: NodeData,
     pub span: Span,
@@ -48,7 +48,7 @@ impl Node {
             || matches!(
                 self.data,
                 NodeData::Sequence(_)
-                    | NodeData::Scalar(OwnedScalar {
+                    | NodeData::Scalar(ScalarNode {
                         style: ScalarStyle::QuotedTrimIndent | ScalarStyle::QuotedTrimWhitespace,
                         ..
                     })
@@ -72,13 +72,13 @@ impl Node {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum NodeData {
-    Scalar(OwnedScalar),
+pub enum NodeData {
+    Scalar(ScalarNode),
     Sequence(SequenceNode),
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SequenceNode {
+pub struct SequenceNode {
     pub style: SequenceStyle,
     pub type_tag: Option<NodeId>,
     pub items: Vec<SequenceItem>,
@@ -91,8 +91,14 @@ impl SequenceNode {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ScalarNode {
+    pub style: ScalarStyle,
+    pub value: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SequenceItem {
+pub struct SequenceItem {
     pub key_node: Option<NodeId>,
     pub value_node: NodeId,
 }
@@ -203,7 +209,7 @@ impl ValueReader for SpannedValueReader {
 }
 
 impl Document {
-    fn get_node<B: ValueReader>(&self, id: NodeId) -> B::Output<'_> {
+    fn read_node<B: ValueReader>(&self, id: NodeId) -> B::Output<'_> {
         let node = &self.nodes[id];
         let anchor = node.anchor.as_ref().map(|anchor| Spanned {
             value: &*anchor.value,
@@ -211,15 +217,23 @@ impl Document {
         });
 
         match &node.data {
-            NodeData::Scalar(scalar) => B::scalar(scalar.borrow().in_span(node.span)),
+            NodeData::Scalar(ScalarNode { value, style }) => B::scalar(
+                Scalar {
+                    value: value.as_str(),
+                    style: *style,
+                    anchor: anchor.map(Spanned::into_inner),
+                }
+                .in_span(node.span),
+            ),
             NodeData::Sequence(sequence) => {
                 let type_tag = if let Some(type_tag) = sequence.type_tag {
                     let type_tag_node = &self.nodes[type_tag];
-                    if let NodeData::Scalar(ref scalar) = type_tag_node.data {
-                        Some(Spanned {
-                            value: scalar.borrow(),
-                            span: type_tag_node.span,
-                        })
+                    if let NodeData::Scalar(ScalarNode {
+                        ref value,
+                        ref style,
+                    }) = type_tag_node.data
+                    {
+                        Some(Scalar::new(value.as_str(), *style).in_span(type_tag_node.span))
                     } else {
                         unreachable!("type tag is not a scalar node")
                     }
@@ -242,13 +256,28 @@ impl Document {
         }
     }
 
+    #[inline]
+    pub fn get_root(&self) -> &SequenceNode {
+        &self.sequence
+    }
+
+    #[inline]
+    pub fn get_node(&self, node_id: NodeId) -> &Node {
+        &self.nodes[node_id]
+    }
+
+    #[inline]
+    pub fn get_node_mut(&mut self, node_id: NodeId) -> &mut Node {
+        &mut self.nodes[node_id]
+    }
+
     fn add_node_to_sequence<'a, B: ValueReader>(
         &'a self,
         item: &SequenceItem,
         seq: &mut B::Seq<'a>,
     ) {
-        let key = item.key_node.map(|key| self.get_node::<B>(key));
-        let value = self.get_node::<B>(item.value_node);
+        let key = item.key_node.map(|key| self.read_node::<B>(key));
+        let value = self.read_node::<B>(item.value_node);
         B::seq_push(seq, key, value);
     }
 
@@ -293,14 +322,14 @@ impl Document {
     pub fn get_tag(&self, tag: &str) -> Option<Value> {
         self.anchors
             .get(tag)
-            .map(|&id| self.get_node::<BareValueReader>(id))
+            .map(|&id| self.read_node::<BareValueReader>(id))
     }
 
     #[inline]
     pub fn get_spanned_tag(&self, tag: &str) -> Option<SpannedValue> {
         self.anchors
             .get(tag)
-            .map(|&id| self.get_node::<SpannedValueReader>(id))
+            .map(|&id| self.read_node::<SpannedValueReader>(id))
     }
 
     pub fn parse<R: BufRead>(reader: R) -> Result<Self, Error> {
@@ -322,11 +351,11 @@ impl Document {
     pub(crate) fn set_anchor(
         &mut self,
         id: NodeId,
-        anchor: Option<String>,
+        anchor: Option<&str>,
     ) -> Result<(), BuilderError> {
         let Some(anchor) = anchor else { return Ok(()) };
 
-        match self.anchors.entry(anchor.clone()) {
+        match self.anchors.entry(anchor.to_owned()) {
             hash_map::Entry::Occupied(entry) => {
                 return Err(BuilderError::DuplicateAnchor(entry.key().clone()));
             }
@@ -342,7 +371,7 @@ impl Document {
 
     pub(crate) fn add_spanned_scalar(
         &mut self,
-        scalar: Spanned<OwnedScalar>,
+        scalar: Spanned<Scalar>,
     ) -> Result<NodeId, BuilderError> {
         let node_id = NodeId(NonZeroUsize::new(self.nodes.len() + 1).unwrap());
 
@@ -353,7 +382,10 @@ impl Document {
                 .anchor
                 .clone()
                 .map(|anchor| anchor.to_owned().in_span(Span::default())),
-            data: NodeData::Scalar(scalar.value.to_owned()),
+            data: NodeData::Scalar(ScalarNode {
+                style: scalar.value.style,
+                value: scalar.value.value.to_owned(),
+            }),
             span: scalar.span,
         });
 
@@ -395,20 +427,20 @@ impl Document {
     pub(crate) fn add_spanned_sequence(
         &mut self,
         style: SequenceStyle,
-        anchor: Option<Spanned<String>>,
+        anchor: Option<Spanned<&str>>,
         type_tag: Option<NodeId>,
         span: Span,
     ) -> Result<NodeId, BuilderError> {
         let node_id = NodeId(NonZeroUsize::new(self.nodes.len() + 1).unwrap());
 
         if let Some(tag) = anchor.clone().map(Spanned::into_inner) {
-            self.set_anchor(node_id, Some(tag.to_owned()))?;
+            self.set_anchor(node_id, Some(tag))?;
             self.incomplete_anchors.insert(tag.to_owned());
         }
         self.incomplete_sequences.insert(node_id);
 
         self.nodes.push(Node {
-            anchor,
+            anchor: anchor.map(|anchor| anchor.map(ToOwned::to_owned)),
             data: NodeData::Sequence(SequenceNode {
                 style,
                 type_tag,
@@ -445,7 +477,7 @@ impl Document {
     ) -> Result<NodeId, BuilderError> {
         self.add_spanned_sequence(
             style,
-            anchor.map(|anchor| anchor.to_owned().in_span(Span::default())),
+            anchor.map(|anchor| anchor.in_span(Span::default())),
             type_tag,
             Span::default(),
         )
@@ -658,7 +690,7 @@ impl PartialEq<SpannedValue<'_>> for Document {
 /// Node IDs are only valid for a particular document, and cannot be reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[doc(hidden)]
-pub struct NodeId(pub(crate) NonZeroUsize);
+pub struct NodeId(pub NonZeroUsize);
 
 impl std::ops::Index<NodeId> for Vec<Node> {
     type Output = Node;

@@ -197,6 +197,10 @@ impl CachedEvent {
         self.ty.is_some()
     }
 
+    pub fn ty(&self) -> Option<EventType> {
+        self.ty.map(|(ty, _)| ty)
+    }
+
     /// Get the stored event.
     pub fn get(&self) -> Option<Event<'_>> {
         let Some((ty, span)) = self.ty else {

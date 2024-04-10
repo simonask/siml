@@ -1,9 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{
-    CharExt, Document, Node, NodeData, NodeId, ScalarStyle, SequenceItem, SequenceNode,
-    SequenceStyle,
-};
+use crate::{private::*, CharExt, Document, NodeId, Scalar, ScalarStyle, SequenceStyle};
 
 pub struct Emitter<W> {
     writer: W,
@@ -161,7 +158,9 @@ impl<'a> SequenceEmitter<'a> {
         if let Some(type_tag) = self.seq.type_tag {
             let node = &self.doc.nodes[type_tag];
             let scalar = match &node.data {
-                NodeData::Scalar(scalar) => scalar.borrow(),
+                NodeData::Scalar(ScalarNode { value, style }) => {
+                    Scalar::new(value.as_str(), *style)
+                }
                 _ => unreachable!("expected scalar node (type tag must be a scalar)"),
             };
             let required_style = ScalarStyle::infer(scalar.value);
@@ -310,7 +309,7 @@ impl<'a> ScalarEmitter<'a> {
         }
 
         let scalar = match &node.data {
-            NodeData::Scalar(scalar) => scalar.borrow(),
+            NodeData::Scalar(ScalarNode { value, style }) => Scalar::new(value.as_str(), *style),
             _ => unreachable!("expected scalar node"),
         };
 
@@ -607,7 +606,7 @@ impl<'a> InlineSequenceBodyEmitter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BuildSeq, Builder, MappingBuilder};
+    use crate::{builder::MappingBuilder, BuildSeq, Builder};
 
     #[test]
     fn basic() -> Result<(), Box<dyn std::error::Error>> {

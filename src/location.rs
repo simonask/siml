@@ -1,4 +1,5 @@
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(C)]
 pub struct SourceLocation {
     /// Offset in Unicode chars from the beginning of the byte stream.
     pub offset: usize,
@@ -108,6 +109,7 @@ impl PartialEq<str> for Spanned<String> {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(C)]
 pub struct Span {
     pub start: SourceLocation,
     pub end: SourceLocation,

@@ -1,0 +1,14 @@
+[package]
+name = "libsiml"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies.siml]
+path = ".."
+
+[dependencies.libc]
+version = "0.2.153"

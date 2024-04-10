@@ -1,9 +1,8 @@
 use std::io::BufRead;
 
 use crate::{
-    CachedEvent, Document, Error, Event, NodeData, NodeId, OwnedScalar, ParseStream, Scalar,
-    ScalarStyle, ScannerError, SequenceItem, SequenceNode, SequenceStyle, Spanned, SpannedExt,
-    Value,
+    private::*, CachedEvent, Document, Error, Event, NodeId, ParseStream, Scalar, ScalarStyle,
+    ScannerError, SequenceStyle, Spanned, SpannedExt, Value,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -107,11 +106,7 @@ impl<'b> MappingBuilder<'b> {
             };
 
             let key_or_value = match event {
-                Event::Scalar(scalar) => Some(
-                    self.builder
-                        .doc
-                        .add_spanned_scalar(scalar.map(Scalar::to_owned))?,
-                ),
+                Event::Scalar(scalar) => Some(self.builder.doc.add_spanned_scalar(scalar)?),
                 Event::Ref(anchor) => Some(self.builder.doc.resolve_anchor(&anchor)?),
                 Event::Merge(anchor) => {
                     if pending_key.is_some() {
@@ -127,13 +122,8 @@ impl<'b> MappingBuilder<'b> {
                     anchor,
                 } => {
                     let type_tag = type_tag
-                        .map(|type_tag| {
-                            self.builder
-                                .doc
-                                .add_spanned_scalar(type_tag.map(Scalar::to_owned))
-                        })
+                        .map(|type_tag| self.builder.doc.add_spanned_scalar(type_tag))
                         .transpose()?;
-                    let anchor = anchor.map(|anchor| anchor.map(ToOwned::to_owned));
 
                     let seq_id = self
                         .builder
@@ -155,13 +145,8 @@ impl<'b> MappingBuilder<'b> {
                     anchor,
                 } => {
                     let type_tag = type_tag
-                        .map(|type_tag| {
-                            self.builder
-                                .doc
-                                .add_spanned_scalar(type_tag.map(Scalar::to_owned))
-                        })
+                        .map(|type_tag| self.builder.doc.add_spanned_scalar(type_tag))
                         .transpose()?;
-                    let anchor = anchor.map(|anchor| anchor.map(ToOwned::to_owned));
 
                     let submap_id = self.builder.doc.add_spanned_sequence(
                         SequenceStyle::Mapping,
@@ -187,7 +172,7 @@ impl<'b> MappingBuilder<'b> {
                         Some(
                             self.builder
                                 .doc
-                                .add_spanned_scalar(OwnedScalar::plain("").in_span(span))?,
+                                .add_spanned_scalar(Scalar::plain("").in_span(span))?,
                         )
                     } else {
                         None
@@ -262,11 +247,7 @@ impl<'b> SequenceBuilder<'b> {
             };
 
             let value = match event {
-                Event::Scalar(scalar) => self
-                    .inner
-                    .builder
-                    .doc
-                    .add_spanned_scalar(scalar.map(Scalar::to_owned))?,
+                Event::Scalar(scalar) => self.inner.builder.doc.add_spanned_scalar(scalar)?,
                 Event::Ref(anchor) => self.inner.builder.doc.resolve_anchor(&anchor)?,
                 Event::Merge(anchor) => {
                     self.inner.builder.merge(self.inner.node, &anchor)?;
@@ -279,14 +260,8 @@ impl<'b> SequenceBuilder<'b> {
                     anchor,
                 } => {
                     let type_tag = type_tag
-                        .map(|type_tag| {
-                            self.inner
-                                .builder
-                                .doc
-                                .add_spanned_scalar(type_tag.map(Scalar::to_owned))
-                        })
+                        .map(|type_tag| self.inner.builder.doc.add_spanned_scalar(type_tag))
                         .transpose()?;
-                    let anchor = anchor.map(|anchor| anchor.map(ToOwned::to_owned));
 
                     let seq_id = self
                         .inner
@@ -312,14 +287,8 @@ impl<'b> SequenceBuilder<'b> {
                     anchor,
                 } => {
                     let type_tag = type_tag
-                        .map(|type_tag| {
-                            self.inner
-                                .builder
-                                .doc
-                                .add_spanned_scalar(type_tag.map(Scalar::to_owned))
-                        })
+                        .map(|type_tag| self.inner.builder.doc.add_spanned_scalar(type_tag))
                         .transpose()?;
-                    let anchor = anchor.map(|anchor| anchor.map(ToOwned::to_owned));
 
                     let submap_id = self.inner.builder.doc.add_spanned_sequence(
                         SequenceStyle::Mapping,
@@ -336,11 +305,7 @@ impl<'b> SequenceBuilder<'b> {
                 }
                 Event::EndMapping(_) => return Err(BuilderError::UnexpectedEvent.into()),
                 Event::Empty(span) => self.inner.builder.doc.add_spanned_scalar(Spanned {
-                    value: OwnedScalar {
-                        style: ScalarStyle::Plain,
-                        value: String::new(),
-                        anchor: None,
-                    },
+                    value: Scalar::plain(""),
                     span,
                 })?,
                 Event::Comment(_) => continue,

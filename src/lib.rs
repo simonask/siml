@@ -1,38 +1,51 @@
 //! Simon's Markup Language
 
-mod char;
+pub mod builder;
+pub mod char;
 mod document;
+pub mod emitter;
 mod error;
 mod event;
 mod input_buffer;
-mod location;
-mod parser;
+pub mod location;
+pub mod parser;
 mod scalar;
 mod scanner;
+mod serialization;
+pub mod string;
 mod token;
 mod value;
 
-pub mod api;
-mod builder;
-mod emitter;
-#[cfg(feature = "serde")]
-mod serialization;
-mod string;
-
-pub use builder::*;
-pub use char::*;
-pub use document::*;
-pub use emitter::*;
+pub use builder::{
+    BuildAsList, BuildAsMapping, BuildAsTuple, BuildSeq, BuildValue, Builder, BuilderError,
+};
+use char::*;
+pub use document::{Document, NodeId};
+pub use emitter::Emitter;
 pub use error::*;
 pub use event::*;
 use input_buffer::*;
-pub use location::*;
+use location::*;
 pub use parser::*;
 pub use scalar::*;
 pub use scanner::*;
-pub use string::*;
+use string::*;
 pub use token::*;
 pub use value::*;
 
 #[cfg(feature = "serde")]
 pub use serialization::*;
+
+#[doc(hidden)]
+pub mod private {
+    pub use crate::document::{Node, NodeData, NodeId, ScalarNode, SequenceItem, SequenceNode};
+}
+
+pub mod prelude {
+    #[doc(no_inline)]
+    pub use crate::{
+        char::CharExt as _, string::StringExt as _, BuildAsList, BuildAsMapping, BuildAsTuple,
+        BuildSeq as _, BuildValue as _, Builder, BuilderError, Document, Emitter, Event,
+        ParseStream, Scalar, ScalarStyle, Scanner, Token, Value,
+    };
+}

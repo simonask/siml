@@ -58,14 +58,19 @@ enum Consume {
 }
 
 impl<R: BufRead> ParseStream<R> {
-    pub fn new(reader: R) -> Self {
+    #[inline]
+    pub fn from_scanner(scanner: Scanner<R>) -> Self {
         Self {
-            scanner: Scanner::new(reader),
+            scanner,
             inner: ParserInner::default(),
-            // Initially populate the lookahead buffer with two tokens.
             pending_consume: Consume::Consume2,
             eof: false,
         }
+    }
+
+    #[inline]
+    pub fn new(reader: R) -> Self {
+        Self::from_scanner(Scanner::new(reader))
     }
 
     pub fn next_event(&mut self, out: &mut CachedEvent) -> Result<(), Error> {
