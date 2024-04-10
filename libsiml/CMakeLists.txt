@@ -57,7 +57,11 @@ endif()
 
 add_library(libsiml_shared SHARED dummy.c)
 set_target_properties(libsiml_shared PROPERTIES OUTPUT_NAME siml)
-target_link_libraries(libsiml_shared libsiml_static)
+if (UNIX)
+    target_link_libraries(libsiml_shared "-Wl,--whole-archive \"${LIBSIML_STATICLIB}\" -Wl,--no-whole-archive")
+elseif(MSVC)
+    target_link_libraries(libsiml_shared "/WHOLEARCHIVE:\"${LIBSIML_STATICLIB}\"")
+endif()
 target_include_directories(libsiml_shared
     PUBLIC
         "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>/include"
