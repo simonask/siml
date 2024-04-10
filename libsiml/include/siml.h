@@ -13,6 +13,7 @@
 #define SIML_H_INCLUDED
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 #define SIML_API extern "C"
