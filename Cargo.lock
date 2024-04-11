@@ -189,6 +189,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libyaml-safer"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2cff24caa08828851c9b7ed1bce365b1d2496b9323dd0d4b241c1d10135f5bd6"
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -279,6 +285,16 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "clio",
+ "siml",
+]
+
+[[package]]
+name = "siml-yaml"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "clio",
+ "libyaml-safer",
  "siml",
 ]
 
