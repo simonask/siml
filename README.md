@@ -36,6 +36,47 @@ can also be parsed as valid SIML.
 
 ## What does it look like?
 
+<table>
+<thead>
+<tr><th>SIML</th><th>YAML</th></tr>
+</thead>
+<tbody>
+<tr>
+<td>
+<pre># Comment
+key1: unquoted-value
+key2: "spaces need quotes"
+list: [
+  1.0,
+  2.0,
+  3.0,
+]
+mapping: {
+  key1: "indentation is not significant"
+}
+type_tags: MyObject {
+  field1: 123
+}
+</pre>
+</td>
+<td><pre># Comment
+hello: unquoted-value
+key2: spaces do not need quotes
+list:
+- 1.0
+- 2.0
+- 3.0
+
+mapping:
+  key1: "indentation is significant"
+
+type_tags: !&lt;MyObject&gt;
+  field1: 123
+</pre></td>
+</tr>
+</tbody>
+</table>
+
 Here are some translated examples from https://json.org/example.html.
 
 ```siml
