@@ -497,6 +497,14 @@ impl Document {
         }
     }
 
+    pub(crate) fn merge_span(&mut self, node: Option<NodeId>, span: Span) {
+        if let Some(node) = node {
+            self.nodes[node].span = self.nodes[node].span.merge(&span);
+        } else {
+            self.span = self.span.merge(&span);
+        }
+    }
+
     /// Add a node as the child of a sequence.
     ///
     /// If `seq` is None, the key-value pair is added to the document's root.

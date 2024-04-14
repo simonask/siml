@@ -7,6 +7,8 @@ use crate::{
     Scalar, ScalarStyle, SequenceStyle, SourceLocation, Spanned, SpannedSequence, SpannedValue,
 };
 
+use super::{Smuggle, LOCATION_TOKEN, SPANNED_TOKEN, SPAN_TOKEN};
+
 impl<'a> From<&'a SpannedSequence<'_>> for Unexpected<'a> {
     #[inline]
     fn from(value: &SpannedSequence) -> Self {
@@ -639,6 +641,14 @@ where
     where
         V: serde::de::Visitor<'de>,
     {
+        if name == SPANNED_TOKEN {
+            return visitor.visit_seq(Smuggle(self, 0));
+        } else if name == SPAN_TOKEN {
+            return visitor.visit_seq(Smuggle(self, 0));
+        } else if name == LOCATION_TOKEN {
+            return visitor.visit_seq(Smuggle(self, 0));
+        }
+
         if let SpannedValue::Sequence(seq) = self {
             if seq.type_tag() == Some(name) && seq.items.len() == len {
                 return visitor.visit_seq(SeqAccess { seq, index: 0 });
@@ -667,7 +677,7 @@ where
 
     fn deserialize_struct<V>(
         self,
-        name: &'static str,
+        _name: &'static str,
         _fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Self::Error>
@@ -675,13 +685,11 @@ where
         V: serde::de::Visitor<'de>,
     {
         if let SpannedValue::Sequence(seq) = self {
-            if seq.type_tag() == Some(name) {
-                return visitor.visit_map(MapAccess {
-                    seq,
-                    index: 0,
-                    next_is_value: false,
-                });
-            }
+            return visitor.visit_map(MapAccess {
+                seq,
+                index: 0,
+                next_is_value: false,
+            });
         }
 
         Err(serde::de::Error::invalid_type(self.into(), &visitor))

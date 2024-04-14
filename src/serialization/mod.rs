@@ -2,14 +2,27 @@
 
 mod de;
 mod ser;
+mod spanned;
 
 use std::fmt::Write;
 
 pub use de::*;
 pub use ser::*;
-use serde::{Deserialize, Serialize};
+use spanned::*;
 
 use crate::{emitter::Emitter, Document, Error, ParseStream, SpannedValue, Value};
+
+use serde::{Deserialize, Serialize};
+
+/// Name of magical field that can be used during deserialization to get the
+/// source span of a value.
+const SPAN_TOKEN: &str = "$siml::private::span$";
+/// Name of magical field that can be used during deserialization to get the
+/// source span of a value.
+const SPANNED_TOKEN: &str = "$siml::private::span$";
+/// Name of magical field that can be used during deserialization to get the
+/// source location of a value.
+const LOCATION_TOKEN: &str = "$siml::private::location$";
 
 impl serde::ser::Error for Error {
     fn custom<T: std::fmt::Display>(msg: T) -> Self {

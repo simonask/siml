@@ -161,10 +161,11 @@ impl<'b> MappingBuilder<'b> {
                     submap_builder.parse(parser, false)?;
                     Some(submap_id)
                 }
-                Event::EndMapping(_) => {
+                Event::EndMapping(span) => {
                     if pending_key.is_some() {
                         return Err(BuilderError::UnexpectedEvent.into());
                     }
+                    self.builder.doc.merge_span(self.node, span);
                     return Ok(());
                 }
                 Event::Empty(span) => {
@@ -278,7 +279,7 @@ impl<'b> SequenceBuilder<'b> {
                     seq_id
                 }
                 Event::EndSequence(span) => {
-                    // TODO: Merge spans
+                    self.inner.builder.doc.merge_span(self.inner.node, span);
                     return Ok(());
                 }
                 Event::BeginMapping {
