@@ -2,6 +2,7 @@
 
 pub mod builder;
 pub mod char;
+mod comment;
 mod document;
 pub mod emitter;
 mod error;
@@ -20,6 +21,7 @@ pub use builder::{
     BuildAsList, BuildAsMapping, BuildAsTuple, BuildSeq, BuildValue, Builder, BuilderError,
 };
 use char::*;
+pub use comment::*;
 pub use document::{Document, NodeId};
 pub use emitter::Emitter;
 pub use error::*;
